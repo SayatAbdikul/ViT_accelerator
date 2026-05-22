@@ -10,6 +10,8 @@
 package fp32_prim_pkg;
   typedef logic [31:0] fp32_t;
   typedef logic [63:0] fp64_t;
+  typedef longint unsigned u64_t;
+  typedef longint signed   s64_t;
 
   localparam fp32_t FP32_QNAN_BITS = 32'h7fc0_0000;
   localparam fp32_t FP32_POS_INF   = 32'h7f80_0000;
@@ -25,24 +27,6 @@ package fp32_prim_pkg;
 
   function automatic bit fp32_is_zero(input fp32_t bits);
     fp32_is_zero = (bits[30:0] == 31'd0);
-  endfunction
-
-  function automatic real fp32_pow2(input int exp);
-    real value_r;
-    int i;
-    begin
-      value_r = 1.0;
-      if (exp >= 0) begin
-        for (i = 0; i < exp; i++) begin
-          value_r = value_r * 2.0;
-        end
-      end else begin
-        for (i = 0; i < -exp; i++) begin
-          value_r = value_r * 0.5;
-        end
-      end
-      fp32_pow2 = value_r;
-    end
   endfunction
 
   function automatic longint unsigned fp32_round_shift_right(
@@ -72,98 +56,6 @@ package fp32_prim_pkg;
         end else begin
           fp32_round_shift_right = quotient;
         end
-      end
-    end
-  endfunction
-
-  function automatic fp32_t fp32_from_fp64_bits(input fp64_t bits64);
-    bit sign_b;
-    int exp64;
-    int exp_unbiased;
-    int exp32;
-    longint unsigned mant53;
-    longint unsigned rounded;
-    int sub_shift;
-    begin
-      sign_b = bits64[63];
-      exp64 = int'(bits64[62:52]);
-      mant53 = {11'd0, 1'b1, bits64[51:0]};
-
-      if (exp64 == 2047) begin
-        if (bits64[51:0] != 52'd0) begin
-          fp32_from_fp64_bits = FP32_QNAN_BITS;
-        end else begin
-          fp32_from_fp64_bits = sign_b ? FP32_NEG_INF : FP32_POS_INF;
-        end
-      end else if (exp64 == 0) begin
-        // Double subnormals are far below FP32 range for the values produced by
-        // this accelerator path. Preserve the sign of underflowed zero.
-        fp32_from_fp64_bits = {sign_b, 31'd0};
-      end else begin
-        exp_unbiased = exp64 - 1023;
-        if (exp_unbiased > 127) begin
-          fp32_from_fp64_bits = sign_b ? FP32_NEG_INF : FP32_POS_INF;
-        end else if (exp_unbiased >= -126) begin
-          rounded = fp32_round_shift_right(mant53, 29); // 53-bit mantissa -> 24 bits
-          if (rounded >= 64'h0000_0000_0100_0000) begin
-            rounded = 64'h0000_0000_0080_0000;
-            exp_unbiased++;
-          end
-          exp32 = exp_unbiased + 127;
-          if (exp32 >= 255) begin
-            fp32_from_fp64_bits = sign_b ? FP32_NEG_INF : FP32_POS_INF;
-          end else begin
-            fp32_from_fp64_bits = {sign_b, exp32[7:0], rounded[22:0]};
-          end
-        end else begin
-          // FP32 subnormal: mantissa = round(value / 2^-149).
-          sub_shift = -(exp_unbiased + 97);
-          rounded = fp32_round_shift_right(mant53, sub_shift);
-          if (rounded == 0) begin
-            fp32_from_fp64_bits = {sign_b, 31'd0};
-          end else if (rounded >= 64'h0000_0000_0080_0000) begin
-            fp32_from_fp64_bits = {sign_b, 8'd1, 23'd0};
-          end else begin
-            fp32_from_fp64_bits = {sign_b, 8'd0, rounded[22:0]};
-          end
-        end
-      end
-    end
-  endfunction
-
-  function automatic fp32_t fp32_real_to_bits(input real value_r);
-    fp32_real_to_bits = fp32_from_fp64_bits($realtobits(value_r));
-  endfunction
-
-  function automatic real fp32_bits_to_real(input fp32_t bits);
-    int exp32;
-    int unsigned frac;
-    real mag_r;
-    real frac_r;
-    fp64_t zero_bits;
-    begin
-      exp32 = int'(bits[30:23]);
-      frac = int'(bits[22:0]);
-      if (exp32 == 255) begin
-        if (frac != 0) begin
-          fp32_bits_to_real = $bitstoreal(64'h7ff8_0000_0000_0000);
-        end else begin
-          fp32_bits_to_real = bits[31]
-              ? $bitstoreal(64'hfff0_0000_0000_0000)
-              : $bitstoreal(64'h7ff0_0000_0000_0000);
-        end
-      end else if (exp32 == 0 && frac == 0) begin
-        zero_bits = bits[31] ? 64'h8000_0000_0000_0000 : 64'h0000_0000_0000_0000;
-        fp32_bits_to_real = $bitstoreal(zero_bits);
-      end else begin
-        if (exp32 == 0) begin
-          frac_r = real'(frac) / 8388608.0;
-          mag_r = frac_r * fp32_pow2(-126);
-        end else begin
-          frac_r = real'(frac) / 8388608.0;
-          mag_r = (1.0 + frac_r) * fp32_pow2(exp32 - 127);
-        end
-        fp32_bits_to_real = bits[31] ? -mag_r : mag_r;
       end
     end
   endfunction
@@ -410,23 +302,349 @@ package fp32_prim_pkg;
     end
   endfunction
 
-  function automatic real fp32_round_real(input real value_r);
-    fp32_round_real = fp32_bits_to_real(fp32_real_to_bits(value_r));
+  // =====================================================================
+  // Synthesizable transcendental / division primitives (no `real`, no DPI).
+  // Spec: rtl/src/include/ARITH_CONTRACT.md. Bit patterns are frozen to
+  // match software/taccel/utils/fp32_prim_ref.py exactly.
+  // =====================================================================
+
+  localparam fp32_t FP32_ONE     = 32'h3F800000;
+  localparam fp32_t FP32_HALF    = 32'h3F000000;
+  localparam fp32_t FP32_NEG_ONE = 32'hBF800000;
+  localparam fp32_t FP32_LOG2E   = 32'h3FB8AA3B;
+  localparam fp32_t FP32_LN2_HI  = 32'h3F317200;
+  localparam fp32_t FP32_LN2_LO  = 32'h35BFBE8E;
+  localparam fp32_t FP32_INVSQRT2= 32'h3F3504F3;
+  // exp(r) Horner coefficients high->low : 1/5040,1/720,1/120,1/24,1/6,1/2,1,1
+  localparam fp32_t FP32_EC0 = 32'h39500D01;
+  localparam fp32_t FP32_EC1 = 32'h3AB60B61;
+  localparam fp32_t FP32_EC2 = 32'h3C088889;
+  localparam fp32_t FP32_EC3 = 32'h3D2AAAAB;
+  localparam fp32_t FP32_EC4 = 32'h3E2AAAAB;
+  localparam fp32_t FP32_EC5 = 32'h3F000000;
+  localparam fp32_t FP32_EC6 = 32'h3F800000;
+  localparam fp32_t FP32_EC7 = 32'h3F800000;
+  // erf (Abramowitz & Stegun 7.1.26) — same bits as taccel_pkg ERF_*
+  localparam fp32_t FP32_ERF_A1 = 32'h3E827906;
+  localparam fp32_t FP32_ERF_A2 = 32'hBE91A98E;
+  localparam fp32_t FP32_ERF_A3 = 32'h3FB5D78E;
+  localparam fp32_t FP32_ERF_A4 = 32'hBFBA0005;
+  localparam fp32_t FP32_ERF_A5 = 32'h3F87DC22;
+  localparam fp32_t FP32_ERF_P  = 32'h3EA7B9D2;
+
+  // floor(sqrt(x)) for a 64-bit unsigned operand (bitwise digit recurrence).
+  function automatic longint unsigned fp32_isqrt64(input longint unsigned x);
+    longint unsigned res;
+    longint unsigned bit_;
+    begin
+      res  = 64'd0;
+      bit_ = 64'h4000_0000_0000_0000; // 1 << 62
+      while (bit_ > x) bit_ = bit_ >> 2;
+      while (bit_ != 64'd0) begin
+        if (x >= res + bit_) begin
+          x   = x - (res + bit_);
+          res = (res >> 1) + bit_;
+        end else begin
+          res = res >> 1;
+        end
+        bit_ = bit_ >> 2;
+      end
+      fp32_isqrt64 = res;
+    end
   endfunction
 
-  function automatic real fp32_add_real(input real lhs_r, input real rhs_r);
-    fp32_add_real = fp32_bits_to_real(
-        fp32_add_bits(fp32_real_to_bits(lhs_r), fp32_real_to_bits(rhs_r)));
+  // Round-and-pack an arbitrary positive fixed-point value M * 2^s into fp32
+  // with RNE. extra_sticky folds any below-LSB residue (e.g. a division
+  // remainder) into the sticky bit. Caller guarantees M > 0.
+  function automatic fp32_t fp32_pack_from_fixed(
+      input bit sign_b,
+      input longint unsigned m_in,
+      input int s_in,
+      input bit extra_sticky
+  );
+    int msb;
+    longint unsigned mn;
+    begin
+      msb = fp32_msb_index(m_in);
+      if (msb > 26) begin
+        mn = fp32_shift_right_sticky(m_in, msb - 26);
+      end else begin
+        mn = m_in << (26 - msb);
+      end
+      if (extra_sticky) mn = mn | 64'd1;
+      fp32_pack_from_fixed = fp32_pack_rounded(sign_b, s_in + msb, mn);
+    end
   endfunction
 
-  function automatic real fp32_sub_real(input real lhs_r, input real rhs_r);
-    fp32_sub_real = fp32_bits_to_real(
-        fp32_sub_bits(fp32_real_to_bits(lhs_r), fp32_real_to_bits(rhs_r)));
+  // Signed integer -> fp32 (RNE for magnitudes that exceed 24 bits).
+  function automatic fp32_t fp32_from_int(input longint signed v);
+    longint unsigned mag;
+    begin
+      if (v == 0) begin
+        fp32_from_int = 32'd0;
+      end else begin
+        mag = v[63] ? u64_t'(-v) : u64_t'(v);
+        fp32_from_int = fp32_pack_from_fixed(v[63], mag, 0, 1'b0);
+      end
+    end
   endfunction
 
-  function automatic real fp32_mul_real(input real lhs_r, input real rhs_r);
-    fp32_mul_real = fp32_bits_to_real(
-        fp32_mul_bits(fp32_real_to_bits(lhs_r), fp32_real_to_bits(rhs_r)));
+  // Signed 8/32-bit integer -> fp32 (RNE for magnitudes > 24 bits, exact below).
+  function automatic fp32_t fp32_from_i8(input logic signed [7:0] v);
+    fp32_from_i8 = fp32_from_int(s64_t'(v));
+  endfunction
+
+  function automatic fp32_t fp32_from_i32(input logic signed [31:0] v);
+    fp32_from_i32 = fp32_from_int(s64_t'(v));
+  endfunction
+
+  // Ordered FP32 greater-than for finite operands (no-NaN paths in the SFU).
+  function automatic bit fp32_gt(input fp32_t a, input fp32_t b);
+    logic        sa, sb;
+    logic [30:0] aa, bb;
+    begin
+      sa = a[31]; sb = b[31];
+      aa = a[30:0]; bb = b[30:0];
+      if ((aa == 31'd0) && (bb == 31'd0)) fp32_gt = 1'b0;            // ±0 == ±0
+      else if (sa != sb)                  fp32_gt = !sa;             // +x > -y
+      else if (!sa)                       fp32_gt = (aa > bb);       // both +
+      else                                fp32_gt = (aa < bb);       // both -
+    end
+  endfunction
+
+  function automatic fp32_t fp32_from_fp16_bits(input logic [15:0] h);
+    bit         s;
+    logic [4:0] e;
+    logic [9:0] f;
+    int         k;
+    u64_t       fr;
+    begin
+      s = h[15];
+      e = h[14:10];
+      f = h[9:0];
+      if ((e == 5'd0) && (f == 10'd0)) begin
+        fp32_from_fp16_bits = {s, 31'd0};
+      end else if (e == 5'd0) begin
+        k  = fp32_msb_index({54'd0, f});
+        fr = (u64_t'(f) - (64'd1 << k)) << (23 - k);
+        fp32_from_fp16_bits = {s, 8'(k + 103), fr[22:0]};
+      end else if (e == 5'h1F) begin
+        fp32_from_fp16_bits = s ? 32'hC77FE000 : 32'h477FE000;
+      end else begin
+        fp32_from_fp16_bits = {s, 8'(int'(e) + 112), f, 13'd0};
+      end
+    end
+  endfunction
+
+  function automatic fp32_t fp32_div_bits(input fp32_t a, input fp32_t b);
+    bit sign_r;
+    bit sa, sb;
+    int ea, eb;
+    longint unsigned ma, mb, p, q, r;
+    begin
+      sign_r = a[31] ^ b[31];
+      if (fp32_is_nan(a) || fp32_is_nan(b)) begin
+        fp32_div_bits = FP32_QNAN_BITS;
+      end else if (fp32_is_inf(a) && fp32_is_inf(b)) begin
+        fp32_div_bits = FP32_QNAN_BITS;
+      end else if (fp32_is_inf(a)) begin
+        fp32_div_bits = sign_r ? FP32_NEG_INF : FP32_POS_INF;
+      end else if (fp32_is_inf(b)) begin
+        fp32_div_bits = {sign_r, 31'd0};
+      end else if (fp32_is_zero(b)) begin
+        fp32_div_bits = fp32_is_zero(a)
+            ? FP32_QNAN_BITS
+            : (sign_r ? FP32_NEG_INF : FP32_POS_INF);
+      end else if (fp32_is_zero(a)) begin
+        fp32_div_bits = {sign_r, 31'd0};
+      end else begin
+        fp32_decode_finite(a, sa, ea, ma);
+        fp32_decode_finite(b, sb, eb, mb);
+        p = ma << 28;
+        q = p / mb;
+        r = p % mb;
+        fp32_div_bits = fp32_pack_from_fixed(sign_r, q, ea - eb - 28, (r != 64'd0));
+      end
+    end
+  endfunction
+
+  function automatic fp32_t fp32_sqrt_bits(input fp32_t x);
+    bit sx;
+    int ex, e2, sh;
+    longint unsigned mx, t, tsc, ssr, rs;
+    begin
+      if (fp32_is_nan(x)) begin
+        fp32_sqrt_bits = FP32_QNAN_BITS;
+      end else if (fp32_is_zero(x)) begin
+        fp32_sqrt_bits = {x[31], 31'd0};
+      end else if (x[31]) begin
+        fp32_sqrt_bits = FP32_QNAN_BITS;            // sqrt of negative
+      end else if (fp32_is_inf(x)) begin
+        fp32_sqrt_bits = FP32_POS_INF;
+      end else begin
+        fp32_decode_finite(x, sx, ex, mx);
+        e2 = ex - 23;
+        if ((e2 & 1) == 1) begin
+          t  = mx << 1;
+          sh = (e2 - 1) / 2;
+        end else begin
+          t  = mx;
+          sh = e2 / 2;
+        end
+        tsc = t << 38;                              // sqrt scales by 2^19
+        ssr = fp32_isqrt64(tsc);
+        rs  = tsc - (ssr * ssr);
+        fp32_sqrt_bits =
+            fp32_pack_from_fixed(1'b0, ssr, sh - 19, (rs != 64'd0));
+      end
+    end
+  endfunction
+
+  // Round fp32 to nearest integer, ties to even. Returns a saturating
+  // sentinel (|.| = 200) when the magnitude is already outside INT8 range.
+  function automatic longint signed fp32_rint_i64(input fp32_t a);
+    bit sx;
+    int ex, nfrac;
+    longint unsigned mx, ip, half, rem, mask;
+    longint signed res;
+    begin
+      if (fp32_is_zero(a)) begin
+        fp32_rint_i64 = 64'sd0;
+      end else if (fp32_is_nan(a)) begin
+        fp32_rint_i64 = 64'sd0;
+      end else if (fp32_is_inf(a)) begin
+        res = s64_t'(64'd1 << 62);                   // overflow sentinel
+        fp32_rint_i64 = a[31] ? -res : res;
+      end else begin
+        fp32_decode_finite(a, sx, ex, mx);
+        if (ex >= 62) begin
+          res = s64_t'(64'd1 << 62);                 // > INT range -> sentinel
+          fp32_rint_i64 = sx ? -res : res;
+        end else if (ex >= 23) begin
+          res = s64_t'(mx << (ex - 23));             // exact integer, no frac
+          fp32_rint_i64 = sx ? -res : res;
+        end else if (ex < -1) begin
+          fp32_rint_i64 = 64'sd0;                    // |a| < 0.5
+        end else begin
+          nfrac = 23 - ex;                           // ex in [-1..22] -> [1..24]
+          ip   = mx >> nfrac;
+          half = 64'd1 << (nfrac - 1);
+          mask = (64'd1 << nfrac) - 64'd1;
+          rem  = mx & mask;
+          if (rem > half) ip = ip + 64'd1;
+          else if (rem == half) ip = ip + (ip & 64'd1);
+          res = s64_t'(ip);
+          fp32_rint_i64 = sx ? -res : res;
+        end
+      end
+    end
+  endfunction
+
+  function automatic longint signed fp32_quantize_i8_bits(
+      input fp32_t v, input fp32_t s
+  );
+    fp32_t qf;
+    longint signed q;
+    begin
+      if (fp32_is_zero(s)) begin
+        fp32_quantize_i8_bits = 64'sd0;
+      end else begin
+        qf = fp32_div_bits(v, s);
+        if (fp32_is_nan(qf)) begin
+          fp32_quantize_i8_bits = 64'sd0;
+        end else if (fp32_is_inf(qf)) begin
+          fp32_quantize_i8_bits = qf[31] ? -64'sd128 : 64'sd127;
+        end else begin
+          q = fp32_rint_i64(qf);
+          if (q < -64'sd128) q = -64'sd128;
+          else if (q > 64'sd127) q = 64'sd127;
+          fp32_quantize_i8_bits = q;
+        end
+      end
+    end
+  endfunction
+
+  function automatic fp32_t fp32_exp_bits(input fp32_t x);
+    fp32_t m, kf, r, p;
+    bit sp;
+    int ep, kk;
+    longint unsigned mp;
+    longint signed k64;
+    begin
+      if (fp32_is_nan(x)) begin
+        fp32_exp_bits = FP32_QNAN_BITS;
+      end else if (fp32_is_inf(x)) begin
+        fp32_exp_bits = x[31] ? 32'd0 : FP32_POS_INF;
+      end else begin
+        m = fp32_mul_bits(x, FP32_LOG2E);
+        if (fp32_is_inf(m) || fp32_is_nan(m)) begin
+          fp32_exp_bits = (fp32_is_nan(m) || m[31]) ?
+              (fp32_is_nan(m) ? FP32_QNAN_BITS : 32'd0) : FP32_POS_INF;
+        end else begin
+          k64 = fp32_rint_i64(m);
+          if (k64 > 64'sd300)  fp32_exp_bits = FP32_POS_INF;
+          else if (k64 < -64'sd160) fp32_exp_bits = 32'd0;
+          else begin
+            kk  = int'(k64);
+            kf  = fp32_from_int(k64);
+            r   = fp32_sub_bits(
+                      fp32_sub_bits(x, fp32_mul_bits(kf, FP32_LN2_HI)),
+                      fp32_mul_bits(kf, FP32_LN2_LO));
+            p = FP32_EC0;
+            p = fp32_add_bits(fp32_mul_bits(p, r), FP32_EC1);
+            p = fp32_add_bits(fp32_mul_bits(p, r), FP32_EC2);
+            p = fp32_add_bits(fp32_mul_bits(p, r), FP32_EC3);
+            p = fp32_add_bits(fp32_mul_bits(p, r), FP32_EC4);
+            p = fp32_add_bits(fp32_mul_bits(p, r), FP32_EC5);
+            p = fp32_add_bits(fp32_mul_bits(p, r), FP32_EC6);
+            p = fp32_add_bits(fp32_mul_bits(p, r), FP32_EC7);
+            fp32_decode_finite(p, sp, ep, mp);
+            fp32_exp_bits = fp32_pack_from_fixed(1'b0, mp, (ep - 23) + kk, 1'b0);
+          end
+        end
+      end
+    end
+  endfunction
+
+  function automatic fp32_t fp32_erf_bits(input fp32_t x);
+    bit    neg;
+    fp32_t a, t, t2, t3, t4, t5, poly, aa, e, y;
+    begin
+      if (fp32_is_zero(x)) begin
+        fp32_erf_bits = 32'd0;
+      end else begin
+        neg = x[31];
+        a   = {1'b0, x[30:0]};
+        t   = fp32_div_bits(FP32_ONE,
+                  fp32_add_bits(FP32_ONE, fp32_mul_bits(FP32_ERF_P, a)));
+        t2  = fp32_mul_bits(t, t);
+        t3  = fp32_mul_bits(t2, t);
+        t4  = fp32_mul_bits(t3, t);
+        t5  = fp32_mul_bits(t4, t);
+        poly = fp32_add_bits(
+                 fp32_add_bits(
+                   fp32_add_bits(
+                     fp32_add_bits(fp32_mul_bits(FP32_ERF_A1, t),
+                                   fp32_mul_bits(FP32_ERF_A2, t2)),
+                     fp32_mul_bits(FP32_ERF_A3, t3)),
+                   fp32_mul_bits(FP32_ERF_A4, t4)),
+                 fp32_mul_bits(FP32_ERF_A5, t5));
+        aa  = fp32_mul_bits(a, a);
+        e   = fp32_exp_bits({~aa[31], aa[30:0]});
+        y   = fp32_sub_bits(FP32_ONE, fp32_mul_bits(poly, e));
+        fp32_erf_bits = neg ? fp32_mul_bits(FP32_NEG_ONE, y) : y;
+      end
+    end
+  endfunction
+
+  function automatic fp32_t fp32_gelu_bits(input fp32_t x);
+    fp32_t e;
+    begin
+      e = fp32_erf_bits(fp32_mul_bits(x, FP32_INVSQRT2));
+      fp32_gelu_bits =
+          fp32_mul_bits(fp32_mul_bits(x, FP32_HALF),
+                        fp32_add_bits(FP32_ONE, e));
+    end
   endfunction
 
 endpackage

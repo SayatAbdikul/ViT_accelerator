@@ -67,8 +67,6 @@ module blocking_helper_engine
   input  logic         sram_b_fault
 );
 
-  import "DPI-C" function int  sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
-
   // State groups:
   //   H_FLAT_*   : BUF_COPY flat copy / memmove
   //   H_TSRC_*   : BUF_COPY transpose source gather
@@ -298,64 +296,9 @@ module blocking_helper_engine
     end
   endfunction
 
-  function automatic real pow2_int(input integer exp_i);
-    real v;
-    integer j;
-    begin
-      v = 1.0;
-      if (exp_i >= 0) begin
-        for (j = 0; j < exp_i; j++)
-          v = v * 2.0;
-      end else begin
-        for (j = 0; j < -exp_i; j++)
-          v = v * 0.5;
-      end
-      pow2_int = v;
-    end
-  endfunction
-
-  function automatic real fp16_to_real(input logic [15:0] bits);
-    logic sign_bit;
-    logic [4:0] exp_bits;
-    logic [9:0] frac_bits;
-    real sign_r;
-    begin
-      sign_bit = bits[15];
-      exp_bits = bits[14:10];
-      frac_bits = bits[9:0];
-      sign_r = sign_bit ? -1.0 : 1.0;
-
-      if ((exp_bits == 5'h0) && (frac_bits == 10'h0)) begin
-        fp16_to_real = 0.0;
-      end else if (exp_bits == 5'h0) begin
-        fp16_to_real = sign_r * (real'(frac_bits) / 1024.0) * pow2_int(-14);
-      end else if (exp_bits == 5'h1F) begin
-        fp16_to_real = sign_r * 65504.0;
-      end else begin
-        fp16_to_real = sign_r *
-                       (1.0 + (real'(frac_bits) / 1024.0)) *
-                       pow2_int(integer'(exp_bits) - 15);
-      end
-      fp16_to_real = fp32_round_real(fp16_to_real);
-    end
-  endfunction
-
-  function automatic integer round_half_even(input real value_r);
-    integer floor_i;
-    real frac_r;
-    begin
-      floor_i = integer'($floor(value_r));
-      frac_r = value_r - real'(floor_i);
-      if (frac_r > 0.5)
-        round_half_even = floor_i + 1;
-      else if (frac_r < 0.5)
-        round_half_even = floor_i;
-      else if (floor_i[0])
-        round_half_even = floor_i + 1;
-      else
-        round_half_even = floor_i;
-    end
-  endfunction
+  // pow2_int / fp16_to_real / round_half_even helpers were removed for
+  // synthesis; the equivalent logic lives in fp32_prim_pkg
+  // (fp32_from_fp16_bits, fp32_from_i8/i32, fp32_quantize_i8_bits).
 
   function automatic logic [127:0] scale_mul_i8_row(
     input logic [127:0] row,
@@ -416,15 +359,15 @@ module blocking_helper_engine
   );
     logic signed [31:0] src_i32;
     logic signed [7:0]  skip_i8;
-    logic [127:0] out_row;
-    real accum_scale_r;
-    real skip_scale_r;
-    real sum_r;
-    integer q_i;
-    integer idx;
+    logic [127:0]       out_row;
+    fp32_t              accum_scale_b;
+    fp32_t              skip_scale_b;
+    fp32_t              sum_b;
+    s64_t               q;
+    integer             idx;
     begin
-      accum_scale_r = fp16_to_real(scale0_val);
-      skip_scale_r  = fp16_to_real(scale1_val);
+      accum_scale_b = fp32_from_fp16_bits(scale0_val);
+      skip_scale_b  = fp32_from_fp16_bits(scale1_val);
       out_row = 128'h0;
       for (idx = 0; idx < 16; idx++) begin
         case (idx[3:2])
@@ -434,17 +377,13 @@ module blocking_helper_engine
           default: src_i32 = row3[(idx[1:0] * 32) +: 32];
         endcase
         skip_i8 = skip_row[(idx * 8) +: 8];
-        sum_r = fp32_add_real(
-            fp32_mul_real(fp32_round_real(real'(src_i32)), accum_scale_r),
-            fp32_mul_real(fp32_round_real(real'(skip_i8)), skip_scale_r)
+        sum_b = fp32_add_bits(
+            fp32_mul_bits(fp32_from_i32(src_i32), accum_scale_b),
+            fp32_mul_bits(fp32_from_i8(skip_i8), skip_scale_b)
         );
-        q_i = integer'(sfu_fp32_quantize_i8(sum_r, 1.0));
-        if (q_i > 127)
-          out_row[(idx * 8) +: 8] = 8'h7F;
-        else if (q_i < -128)
-          out_row[(idx * 8) +: 8] = 8'h80;
-        else
-          out_row[(idx * 8) +: 8] = q_i[7:0];
+        // quantize with scale=1.0 -> round-half-even + clamp to [-128,127].
+        q = fp32_quantize_i8_bits(sum_b, FP32_ONE);
+        out_row[(idx * 8) +: 8] = q[7:0];
       end
       dequant_add_pack = out_row;
     end

@@ -49,9 +49,34 @@ CONTROL_SV    := $(PKG) \
 
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_fp32_prims test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
-        test_systolic_query test_systolic_qkt clean
+        test_systolic_query test_systolic_qkt synth_gate lint clean
 
 all: test_decode test_control test_dma test_helpers test_fp32_prims test_sfu test_systolic
+
+# -----------------------------------------------------------------------
+# synth_gate: fail if non-synthesizable constructs (DPI-C, SystemVerilog
+# `real`, $realtobits/$bitstoreal/$itor/$rtoi) appear in the synthesizable
+# RTL set (CONTROL_SV — packages + engines + memory + systolic + dma + top;
+# the tb/ harness is intentionally excluded). Line comments are stripped
+# before matching. This gate FAILS today by design and is the burndown
+# target for the DPI/real removal work (see include/ARITH_CONTRACT.md).
+# -----------------------------------------------------------------------
+SYNTH_GATE_SRC := $(sort $(CONTROL_SV))
+SYNTH_GATE_RE  := import[[:space:]]+"DPI-C"|(^|[^A-Za-z0-9_])real([^A-Za-z0-9_]|$$)|\$$realtobits|\$$bitstoreal|\$$itor|\$$rtoi|\$$shortrealtobits
+
+synth_gate:
+	@echo "--- SYNTH_BUILD gate: scanning synthesizable RTL ---"
+	@fail=0; for f in $(SYNTH_GATE_SRC); do \
+	  hits=$$(sed 's://.*::' $$f | grep -nE '$(SYNTH_GATE_RE)' || true); \
+	  if [ -n "$$hits" ]; then echo "[SYNTH-GATE] $$f"; echo "$$hits"; fail=1; fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "SYNTH_BUILD gate FAILED (non-synthesizable constructs above)"; exit 1; fi; \
+	echo "SYNTH_BUILD gate PASSED"
+
+lint: synth_gate
+	$(VERILATOR) --lint-only -Wall -Wno-UNUSED -Wno-UNDRIVEN \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) --top-module taccel_top $(CONTROL_SV)
+	@echo "--- lint OK ---"
 
 # -----------------------------------------------------------------------
 # run_program: build the full-program Verilator runner

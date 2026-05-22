@@ -65,14 +65,8 @@ module sfu_engine
   input  logic         sram_b_fault
 );
 
-  import "DPI-C" function real sfu_fp32_div(input real lhs_r, input real rhs_r);
-  import "DPI-C" function real sfu_fp32_exp(input real value_r);
-  import "DPI-C" function real sfu_fp32_sqrt(input real value_r);
-  import "DPI-C" function real sfu_fp32_gelu(input real value_r);
-  import "DPI-C" function int sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
-
-  localparam int SFU_MAX_ROW_ELEMS = 208;
-  localparam real LN_EPS = 1.0e-6;
+  localparam int    SFU_MAX_ROW_ELEMS = 208;
+  localparam fp32_t LN_EPS = 32'h358637BD;        // fp32(1e-6); see ARITH_CONTRACT.md
 
   typedef enum logic [4:0] {
     F_IDLE          = 5'd0,
@@ -126,19 +120,19 @@ module sfu_engine
   logic [127:0] gelu_i8_row_q;
   logic [127:0] gelu_row0_q, gelu_row1_q, gelu_row2_q, gelu_row3_q;
 
-  real scale0_q /* verilator public_flat_rd */, scale1_q /* verilator public_flat_rd */,
-       scale2_q /* verilator public_flat_rd */, scale3_q /* verilator public_flat_rd */;
-  real row_data_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
-  real attn_accum_q [0:SFU_MAX_ROW_ELEMS-1];
-  real gamma_q    [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
-  real beta_q     [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  fp32_t scale0_q /* verilator public_flat_rd */, scale1_q /* verilator public_flat_rd */,
+         scale2_q /* verilator public_flat_rd */, scale3_q /* verilator public_flat_rd */;
+  fp32_t row_data_q   [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  fp32_t attn_accum_q [0:SFU_MAX_ROW_ELEMS-1];
+  fp32_t gamma_q      [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  fp32_t beta_q       [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   logic [7:0] out_bytes_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
-  real attn_row_max_q;
-  real attn_exp_sum_q;
-  real ln_debug_mean_q /* verilator public_flat_rd */;
-  real ln_debug_var_q /* verilator public_flat_rd */;
-  real ln_debug_denom_q /* verilator public_flat_rd */;
-  real ln_debug_y_q [0:15] /* verilator public_flat_rd */;
+  fp32_t attn_row_max_q;
+  fp32_t attn_exp_sum_q;
+  fp32_t ln_debug_mean_q /* verilator public_flat_rd */;
+  fp32_t ln_debug_var_q /* verilator public_flat_rd */;
+  fp32_t ln_debug_denom_q /* verilator public_flat_rd */;
+  fp32_t ln_debug_y_q [0:15] /* verilator public_flat_rd */;
 
   logic [14:0] dispatch_m_rows_w;
   logic [10:0] dispatch_n_tiles_w;
@@ -192,47 +186,9 @@ module sfu_engine
     end
   endfunction
 
-  function automatic real pow2_int(input integer exp_i);
-    real v;
-    integer j;
-    begin
-      v = 1.0;
-      if (exp_i >= 0) begin
-        for (j = 0; j < exp_i; j++)
-          v = v * 2.0;
-      end else begin
-        for (j = 0; j < -exp_i; j++)
-          v = v * 0.5;
-      end
-      pow2_int = v;
-    end
-  endfunction
-
-  function automatic real fp16_to_real(input logic [15:0] bits);
-    logic sign_bit;
-    logic [4:0] exp_bits;
-    logic [9:0] frac_bits;
-    real sign_r;
-    begin
-      sign_bit = bits[15];
-      exp_bits = bits[14:10];
-      frac_bits = bits[9:0];
-      sign_r = sign_bit ? -1.0 : 1.0;
-
-      if ((exp_bits == 5'h0) && (frac_bits == 10'h0)) begin
-        fp16_to_real = 0.0;
-      end else if (exp_bits == 5'h0) begin
-        fp16_to_real = sign_r * (real'(frac_bits) / 1024.0) * pow2_int(-14);
-      end else if (exp_bits == 5'h1F) begin
-        fp16_to_real = sign_r * 65504.0;
-      end else begin
-        fp16_to_real = sign_r *
-                       (1.0 + (real'(frac_bits) / 1024.0)) *
-                       pow2_int(integer'(exp_bits) - 15);
-      end
-      fp16_to_real = fp32_round_real(fp16_to_real);
-    end
-  endfunction
+  // FP16 widening and INT->FP32 conversions live in fp32_prim_pkg
+  // (fp32_from_fp16_bits / fp32_from_i8 / fp32_from_i32). The legacy
+  // pow2_int / fp16_to_real helpers were removed for synthesis.
 
   function automatic logic signed [7:0] get_i8(
     input logic [127:0] row,
@@ -262,28 +218,14 @@ module sfu_engine
   endfunction
 
   function automatic logic [7:0] quantize_to_i8(
-    input real value_r,
-    input real out_scale_r
+    input fp32_t value_bits,
+    input fp32_t out_scale_bits
   );
-    int q_i;
+    s64_t q;
     begin
-      if (out_scale_r == 0.0) begin
-        quantize_to_i8 = 8'h00;
-      end else begin
-        q_i = sfu_fp32_quantize_i8(value_r, out_scale_r);
-        if (q_i > 127)
-          quantize_to_i8 = 8'h7F;
-        else if (q_i < -128)
-          quantize_to_i8 = 8'h80;
-        else
-          quantize_to_i8 = q_i[7:0];
-      end
-    end
-  endfunction
-
-  function automatic real gelu_real(input real x_r);
-    begin
-      gelu_real = sfu_fp32_gelu(x_r);
+      // fp32_quantize_i8_bits handles out_scale==0 and clamps to [-128,127].
+      q = fp32_quantize_i8_bits(value_bits, out_scale_bits);
+      quantize_to_i8 = q[7:0];
     end
   endfunction
 
@@ -428,24 +370,24 @@ module sfu_engine
     attn_write_data_w = 128'h0;
 
     for (int lane = 0; lane < 16; lane++) begin
-      int idx;
-      real x_r;
+      int    idx;
+      fp32_t x_b;
       idx = integer'(write_chunk_q) * 16 + lane;
       if (idx < integer'(n_elems_q))
         row_write_data_w[(lane * 8) +: 8] = out_bytes_q[idx];
 
-      x_r = fp32_mul_real(real'(get_i8(gelu_i8_row_q, lane)), scale0_q);
-      gelu_i8_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
+      x_b = fp32_mul_bits(fp32_from_i8(get_i8(gelu_i8_row_q, lane)), scale0_q);
+      gelu_i8_write_data_w[(lane * 8) +: 8] = quantize_to_i8(fp32_gelu_bits(x_b), scale1_q);
 
       if (lane < 4) begin
-        x_r = fp32_mul_real(real'(get_i32(gelu_row0_q, lane)), scale0_q);
-        gelu_i32_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = fp32_mul_real(real'(get_i32(gelu_row1_q, lane)), scale0_q);
-        gelu_i32_write_data_w[((lane + 4) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = fp32_mul_real(real'(get_i32(gelu_row2_q, lane)), scale0_q);
-        gelu_i32_write_data_w[((lane + 8) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = fp32_mul_real(real'(get_i32(gelu_row3_q, lane)), scale0_q);
-        gelu_i32_write_data_w[((lane + 12) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
+        x_b = fp32_mul_bits(fp32_from_i32(get_i32(gelu_row0_q, lane)), scale0_q);
+        gelu_i32_write_data_w[(lane * 8) +: 8] = quantize_to_i8(fp32_gelu_bits(x_b), scale1_q);
+        x_b = fp32_mul_bits(fp32_from_i32(get_i32(gelu_row1_q, lane)), scale0_q);
+        gelu_i32_write_data_w[((lane + 4) * 8) +: 8] = quantize_to_i8(fp32_gelu_bits(x_b), scale1_q);
+        x_b = fp32_mul_bits(fp32_from_i32(get_i32(gelu_row2_q, lane)), scale0_q);
+        gelu_i32_write_data_w[((lane + 8) * 8) +: 8] = quantize_to_i8(fp32_gelu_bits(x_b), scale1_q);
+        x_b = fp32_mul_bits(fp32_from_i32(get_i32(gelu_row3_q, lane)), scale0_q);
+        gelu_i32_write_data_w[((lane + 12) * 8) +: 8] = quantize_to_i8(fp32_gelu_bits(x_b), scale1_q);
       end
 
       idx = integer'(write_chunk_q) * 16 + lane;
@@ -486,24 +428,24 @@ module sfu_engine
       gelu_row2_q    <= 128'h0;
       gelu_row3_q    <= 128'h0;
       row_write_q    <= 128'h0;
-      scale0_q       <= 0.0;
-      scale1_q       <= 0.0;
-      scale2_q       <= 0.0;
-      scale3_q       <= 0.0;
-      attn_row_max_q <= 0.0;
-      attn_exp_sum_q <= 0.0;
-      ln_debug_mean_q <= 0.0;
-      ln_debug_var_q <= 0.0;
-      ln_debug_denom_q <= 0.0;
+      scale0_q       <= 32'd0;
+      scale1_q       <= 32'd0;
+      scale2_q       <= 32'd0;
+      scale3_q       <= 32'd0;
+      attn_row_max_q <= 32'd0;
+      attn_exp_sum_q <= 32'd0;
+      ln_debug_mean_q <= 32'd0;
+      ln_debug_var_q <= 32'd0;
+      ln_debug_denom_q <= 32'd0;
       for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-        row_data_q[i] <= 0.0;
-        attn_accum_q[i] <= 0.0;
-        gamma_q[i]    <= 0.0;
-        beta_q[i]     <= 0.0;
+        row_data_q[i] <= 32'd0;
+        attn_accum_q[i] <= 32'd0;
+        gamma_q[i]    <= 32'd0;
+        beta_q[i]     <= 32'd0;
         out_bytes_q[i] <= 8'h00;
       end
       for (int i = 0; i < 16; i++)
-        ln_debug_y_q[i] <= 0.0;
+        ln_debug_y_q[i] <= 32'd0;
     end else begin
       case (state)
         F_IDLE: begin
@@ -525,15 +467,15 @@ module sfu_engine
             k_elems_q       <= dispatch_k_elems_w;
             ln_gamma_rows_q <= dispatch_ln_gamma_rows_w;
             ln_param_rows_q <= dispatch_ln_param_rows_w;
-            scale0_q        <= fp16_to_real(scale0_data);
-            scale1_q        <= fp16_to_real(scale1_data);
-            scale2_q        <= fp16_to_real(scale2_data);
-            scale3_q        <= fp16_to_real(scale3_data);
-            ln_debug_mean_q <= 0.0;
-            ln_debug_var_q <= 0.0;
-            ln_debug_denom_q <= 0.0;
+            scale0_q        <= fp32_from_fp16_bits(scale0_data);
+            scale1_q        <= fp32_from_fp16_bits(scale1_data);
+            scale2_q        <= fp32_from_fp16_bits(scale2_data);
+            scale3_q        <= fp32_from_fp16_bits(scale3_data);
+            ln_debug_mean_q <= 32'd0;
+            ln_debug_var_q <= 32'd0;
+            ln_debug_denom_q <= 32'd0;
             for (int i = 0; i < 16; i++)
-              ln_debug_y_q[i] <= 0.0;
+              ln_debug_y_q[i] <= 32'd0;
             row_idx_q       <= 15'h0;
             read_idx_q      <= 13'h0;
             write_chunk_q   <= 11'h0;
@@ -594,9 +536,9 @@ module sfu_engine
           for (int lane = 0; lane < 8; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q)) begin
               if (integer'(read_idx_q) < integer'(ln_gamma_rows_q))
-                gamma_q[base_idx + lane] <= fp16_to_real(get_u16(sram_b_rdata, lane));
+                gamma_q[base_idx + lane] <= fp32_from_fp16_bits(get_u16(sram_b_rdata, lane));
               else
-                beta_q[base_idx + lane] <= fp16_to_real(get_u16(sram_b_rdata, lane));
+                beta_q[base_idx + lane] <= fp32_from_fp16_bits(get_u16(sram_b_rdata, lane));
             end
           end
 
@@ -624,7 +566,7 @@ module sfu_engine
           for (int lane = 0; lane < 16; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q))
               row_data_q[base_idx + lane] <=
-                  fp32_mul_real(real'(get_i8(sram_b_rdata, lane)), scale0_q);
+                  fp32_mul_bits(fp32_from_i8(get_i8(sram_b_rdata, lane)), scale0_q);
           end
 
           if (read_idx_q + 13'd1 < {2'h0, n_tiles_q}) begin
@@ -651,7 +593,7 @@ module sfu_engine
           for (int lane = 0; lane < 4; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q))
               row_data_q[base_idx + lane] <=
-                  fp32_mul_real(real'(get_i32(sram_b_rdata, lane)), scale0_q);
+                  fp32_mul_bits(fp32_from_i32(get_i32(sram_b_rdata, lane)), scale0_q);
           end
 
           if (read_idx_q + 13'd1 < n_chunks_i32_q) begin
@@ -665,68 +607,70 @@ module sfu_engine
 
         F_ROW_COMPUTE: begin
           if (opcode_q == OP_SOFTMAX) begin
-            real row_max_r;
-            real exp_sum_r;
-            real exp_r;
-            row_max_r = row_data_q[0];
+            fp32_t row_max_b;
+            fp32_t exp_sum_b;
+            fp32_t exp_b;
+            row_max_b = row_data_q[0];
             for (int i = 1; i < SFU_MAX_ROW_ELEMS; i++) begin
-              if ((i < integer'(n_elems_q)) && (row_data_q[i] > row_max_r))
-                row_max_r = row_data_q[i];
+              if ((i < integer'(n_elems_q)) && fp32_gt(row_data_q[i], row_max_b))
+                row_max_b = row_data_q[i];
             end
 
-            exp_sum_r = 0.0;
+            exp_sum_b = 32'd0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q)) begin
-                exp_r = sfu_fp32_exp(fp32_sub_real(row_data_q[i], row_max_r));
-                exp_sum_r = fp32_add_real(exp_sum_r, exp_r);
+                exp_b = fp32_exp_bits(fp32_sub_bits(row_data_q[i], row_max_b));
+                exp_sum_b = fp32_add_bits(exp_sum_b, exp_b);
               end
             end
 
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q)) begin
-                exp_r = sfu_fp32_exp(fp32_sub_real(row_data_q[i], row_max_r));
-                out_bytes_q[i] <= quantize_to_i8(sfu_fp32_div(exp_r, exp_sum_r), scale1_q);
+                exp_b = fp32_exp_bits(fp32_sub_bits(row_data_q[i], row_max_b));
+                out_bytes_q[i] <= quantize_to_i8(fp32_div_bits(exp_b, exp_sum_b), scale1_q);
               end
             end
           end else begin
-            real sum_r;
-            real mean_r;
-            real var_r;
-            real denom_r;
-            sum_r = 0.0;
+            fp32_t sum_b;
+            fp32_t mean_b;
+            fp32_t var_b;
+            fp32_t denom_b;
+            fp32_t n_b;
+            n_b = fp32_from_i32({16'd0, n_elems_q});
+            sum_b = 32'd0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q))
-                sum_r = fp32_add_real(sum_r, row_data_q[i]);
+                sum_b = fp32_add_bits(sum_b, row_data_q[i]);
             end
-            mean_r = sfu_fp32_div(sum_r, real'(n_elems_q));
+            mean_b = fp32_div_bits(sum_b, n_b);
 
-            var_r = 0.0;
+            var_b = 32'd0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q)) begin
-                real diff_r;
-                diff_r = fp32_sub_real(row_data_q[i], mean_r);
-                var_r = fp32_add_real(var_r, fp32_mul_real(diff_r, diff_r));
+                fp32_t diff_b;
+                diff_b = fp32_sub_bits(row_data_q[i], mean_b);
+                var_b = fp32_add_bits(var_b, fp32_mul_bits(diff_b, diff_b));
               end
             end
-            var_r = sfu_fp32_div(var_r, real'(n_elems_q));
-            denom_r = sfu_fp32_sqrt(fp32_add_real(var_r, LN_EPS));
-            ln_debug_mean_q <= mean_r;
-            ln_debug_var_q <= var_r;
-            ln_debug_denom_q <= denom_r;
+            var_b = fp32_div_bits(var_b, n_b);
+            denom_b = fp32_sqrt_bits(fp32_add_bits(var_b, LN_EPS));
+            ln_debug_mean_q <= mean_b;
+            ln_debug_var_q <= var_b;
+            ln_debug_denom_q <= denom_b;
 
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-              real y_r;
+              fp32_t y_b;
               if (i < integer'(n_elems_q)) begin
-                y_r = fp32_add_real(
-                    fp32_mul_real(
-                        sfu_fp32_div(fp32_sub_real(row_data_q[i], mean_r), denom_r),
+                y_b = fp32_add_bits(
+                    fp32_mul_bits(
+                        fp32_div_bits(fp32_sub_bits(row_data_q[i], mean_b), denom_b),
                         gamma_q[i]),
                     beta_q[i]);
-                out_bytes_q[i] <= quantize_to_i8(y_r, scale1_q);
+                out_bytes_q[i] <= quantize_to_i8(y_b, scale1_q);
                 if (i < 16)
-                  ln_debug_y_q[i] <= y_r;
+                  ln_debug_y_q[i] <= y_b;
               end else if (i < 16) begin
-                ln_debug_y_q[i] <= 0.0;
+                ln_debug_y_q[i] <= 32'd0;
               end
             end
           end
@@ -846,7 +790,7 @@ module sfu_engine
           for (int lane = 0; lane < 4; lane++) begin
             if ((base_idx + lane) < integer'(k_elems_q))
               row_data_q[base_idx + lane] <=
-                  fp32_mul_real(real'(get_i32(sram_b_rdata, lane)), scale0_q);
+                  fp32_mul_bits(fp32_from_i32(get_i32(sram_b_rdata, lane)), scale0_q);
           end
 
           if (read_idx_q + 13'd1 < k_chunks_i32_q) begin
@@ -858,25 +802,25 @@ module sfu_engine
         end
 
         F_ATTN_PREP: begin
-          real row_max_r;
-          real exp_sum_r;
-          row_max_r = row_data_q[0];
+          fp32_t row_max_b;
+          fp32_t exp_sum_b;
+          row_max_b = row_data_q[0];
           for (int i = 1; i < SFU_MAX_ROW_ELEMS; i++) begin
-            if ((i < integer'(k_elems_q)) && (row_data_q[i] > row_max_r))
-              row_max_r = row_data_q[i];
+            if ((i < integer'(k_elems_q)) && fp32_gt(row_data_q[i], row_max_b))
+              row_max_b = row_data_q[i];
           end
 
-          exp_sum_r = 0.0;
+          exp_sum_b = 32'd0;
           for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
             if (i < integer'(k_elems_q))
-              exp_sum_r = fp32_add_real(
-                  exp_sum_r, sfu_fp32_exp(fp32_sub_real(row_data_q[i], row_max_r)));
+              exp_sum_b = fp32_add_bits(
+                  exp_sum_b, fp32_exp_bits(fp32_sub_bits(row_data_q[i], row_max_b)));
             if (i < integer'(n_elems_q))
-              attn_accum_q[i] <= 0.0;
+              attn_accum_q[i] <= 32'd0;
           end
 
-          attn_row_max_q <= row_max_r;
-          attn_exp_sum_q <= exp_sum_r;
+          attn_row_max_q <= row_max_b;
+          attn_exp_sum_q <= exp_sum_b;
           attn_k_idx_q   <= 16'h0;
           read_idx_q     <= 13'h0;
           write_chunk_q  <= 11'h0;
@@ -893,18 +837,18 @@ module sfu_engine
         end
 
         F_ATTN_V_LATCH: begin
-          real weight_r;
-          weight_r = sfu_fp32_div(
-              sfu_fp32_exp(fp32_sub_real(row_data_q[integer'(attn_k_idx_q)], attn_row_max_q)),
+          fp32_t weight_b;
+          weight_b = fp32_div_bits(
+              fp32_exp_bits(fp32_sub_bits(row_data_q[integer'(attn_k_idx_q)], attn_row_max_q)),
               attn_exp_sum_q);
           for (int lane = 0; lane < 16; lane++) begin
             integer idx;
             idx = integer'(read_idx_q) * 16 + lane;
             if (idx < integer'(n_elems_q))
-              attn_accum_q[idx] <= fp32_add_real(
+              attn_accum_q[idx] <= fp32_add_bits(
                   attn_accum_q[idx],
-                  fp32_mul_real(
-                      fp32_mul_real(weight_r, real'(get_i8(sram_b_rdata, lane))),
+                  fp32_mul_bits(
+                      fp32_mul_bits(weight_b, fp32_from_i8(get_i8(sram_b_rdata, lane))),
                       scale1_q));
           end
 

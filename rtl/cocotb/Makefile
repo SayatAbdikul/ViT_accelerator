@@ -28,6 +28,7 @@ INCLUDE_DIR   := $(SRC_DIR)/include
 # All SV source files for Phase 2 (order matters for Icarus)
 VERILOG_SOURCES := \
   $(INCLUDE_DIR)/taccel_pkg.sv \
+  $(INCLUDE_DIR)/fp32_prim_pkg.sv \
   $(SRC_DIR)/decode_unit.sv \
   $(SRC_DIR)/fetch_unit.sv \
   $(SRC_DIR)/control_unit.sv \

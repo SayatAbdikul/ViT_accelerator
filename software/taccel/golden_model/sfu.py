@@ -26,6 +26,7 @@ workload.
 import numpy as np
 from . import memory
 from ..isa.opcodes import BUF_ACCUM
+from ..utils import fp32_prim_ref as fpr
 from ..quantizer.twin_uniform import (
     quantize_dequant_gelu_twin,
     quantize_dequant_softmax_twin,
@@ -110,27 +111,25 @@ def execute_layernorm(state, insn):
 
     inp = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, N)
 
-    # Read gamma, beta — stored as FP16, widen to FP32
+    # Read gamma, beta — stored as FP16, widen to FP32 via the shared twin
+    # (reproduces the RTL fp32_from_fp16 inf/NaN -> ±65504 clamp).
     gb_bytes = memory.read_bytes(state, insn.src2_buf, insn.src2_off, N * 4)
-    gamma = np.frombuffer(gb_bytes[:N * 2], dtype=np.float16).astype(np.float32)
-    beta  = np.frombuffer(gb_bytes[N * 2:], dtype=np.float16).astype(np.float32)
+    gamma = fpr.fp32_from_fp16_arr(np.frombuffer(gb_bytes[:N * 2], dtype=np.uint16))
+    beta  = fpr.fp32_from_fp16_arr(np.frombuffer(gb_bytes[N * 2:], dtype=np.uint16))
 
-    # Dequantize: INT8 × FP32(in_scale) → FP32
-    x = inp.astype(np.float32) * in_scale
+    # Dequantize: INT8 × FP32(in_scale) → FP32 (elementwise == RTL fp32_mul)
+    x = (inp.astype(np.float32) * in_scale).astype(np.float32)
 
-    # Normalize in FP32 (epsilon = 1e-6 matches PyTorch LayerNorm default)
+    # Normalize in FP32. Mean/var are SEQUENTIAL left folds matching the RTL
+    # FSM element order (sfu_engine.sv:696-711), NOT numpy pairwise sums.
     eps = np.float32(1e-6)
-    mean = x.mean(axis=-1, keepdims=True)
-    var  = x.var(axis=-1,  keepdims=True)
-    x_norm = (x - mean) / np.sqrt(var + eps)
-    x_out = x_norm * gamma + beta   # FP32 affine
+    mean = fpr.fp32_mean_rows(x)[:, None]
+    var = fpr.fp32_var_rows(x, mean)[:, None]
+    denom = np.sqrt((var + eps).astype(np.float32), dtype=np.float32)
+    x_norm = ((x - mean).astype(np.float32) / denom).astype(np.float32)
+    x_out = ((x_norm * gamma).astype(np.float32) + beta).astype(np.float32)
 
-    # Requantize: round-half-to-even, clip to INT8
-    if out_scale == np.float32(0):
-        result = np.zeros_like(inp)
-    else:
-        result = np.clip(np.round(x_out / out_scale), -128, 127).astype(np.int8)
-
+    result = fpr.fp32_quantize_i8_arr(x_out, out_scale)
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
     state.cycle_count += M * N * CYCLE_PER_ELEMENT
 
@@ -160,10 +159,13 @@ def execute_softmax(state, insn):
         inp_i8 = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, N)
         x = inp_i8.astype(np.float32) * in_scale
 
-    # Numerically stable softmax in FP32
-    x_shifted = x - x.max(axis=-1, keepdims=True)
-    exp_x = np.exp(x_shifted).astype(np.float32)
-    x_out = exp_x / exp_x.sum(axis=-1, keepdims=True)
+    # Numerically stable softmax in FP32. row-max is order-independent;
+    # exp() and the exp-sum SEQUENTIAL fold match RTL (sfu_engine.sv:677-690).
+    x = x.astype(np.float32)
+    x_shifted = (x - x.max(axis=-1, keepdims=True)).astype(np.float32)
+    exp_x = fpr.fp32_exp_arr(x_shifted)
+    denom = fpr.fp32_sum_rows(exp_x)[:, None]
+    x_out = (exp_x / denom).astype(np.float32)
     softmax_spec = _runtime_twin_spec(state, "softmax")
     if softmax_spec is not None:
         x_out = quantize_dequant_softmax_twin(
@@ -171,12 +173,7 @@ def execute_softmax(state, insn):
             float(softmax_spec.get("range1_max", 1.0)),
         ).astype(np.float32)
 
-    # Requantize: round-half-to-even, clip to INT8
-    if out_scale == np.float32(0):
-        result = np.zeros((M, N), dtype=np.int8)
-    else:
-        result = np.clip(np.round(x_out / out_scale), -128, 127).astype(np.int8)
-
+    result = fpr.fp32_quantize_i8_arr(x_out, out_scale)
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
     state.cycle_count += M * N * CYCLE_PER_ELEMENT
 
@@ -209,10 +206,10 @@ def execute_gelu(state, insn):
         # Dequantize: INT8 × FP32(in_scale) → FP32
         x = inp.astype(np.float32) * in_scale
 
-    # GELU in FP32
-    from scipy.special import erf
-    sqrt2 = np.float32(np.sqrt(np.float32(2.0)))
-    x_out = x * np.float32(0.5) * (np.float32(1.0) + erf(x / sqrt2).astype(np.float32))
+    # GELU in FP32 via the shared A&S 7.1.26 poly twin (== RTL fp32_gelu_bits;
+    # the old scipy.special.erf path is not hardware-realizable).
+    x = x.astype(np.float32)
+    x_out = fpr.fp32_gelu_arr(x)
     gelu_spec = _runtime_twin_spec(state, "gelu")
     if gelu_spec is not None:
         x_out = quantize_dequant_gelu_twin(
@@ -221,12 +218,7 @@ def execute_gelu(state, insn):
             negative_extent=float(gelu_spec.get("negative_extent", 1e-8)),
         ).astype(np.float32)
 
-    # Requantize: round-half-to-even, clip to INT8
-    if out_scale == np.float32(0):
-        result = np.zeros((M, N), dtype=np.int8)
-    else:
-        result = np.clip(np.round(x_out / out_scale), -128, 127).astype(np.int8)
-
+    result = fpr.fp32_quantize_i8_arr(x_out, out_scale)
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
     state.cycle_count += M * N * CYCLE_PER_ELEMENT
 
@@ -261,30 +253,27 @@ def execute_softmax_attnv(state, insn):
     qkt_i32 = memory.read_int32_tile(state, BUF_ACCUM, insn.src1_off, M, K)
     v_i8 = memory.read_int8_tile(state, insn.src2_buf, insn.src2_off, K, N)
 
-    qkt = qkt_i32.astype(np.float32) * qkt_in_scale
-    v = v_i8.astype(np.float32) * v_scale
+    qkt = (qkt_i32.astype(np.float32) * qkt_in_scale).astype(np.float32)
+    v = (v_i8.astype(np.float32) * v_scale).astype(np.float32)
 
-    qkt_shifted = qkt - qkt.max(axis=-1, keepdims=True)
-    exp_qkt = np.exp(qkt_shifted).astype(np.float32)
-    softmax = exp_qkt / exp_qkt.sum(axis=-1, keepdims=True)
+    qkt_shifted = (qkt - qkt.max(axis=-1, keepdims=True)).astype(np.float32)
+    exp_qkt = fpr.fp32_exp_arr(qkt_shifted)
+    softmax = (exp_qkt / fpr.fp32_sum_rows(exp_qkt)[:, None]).astype(np.float32)
     softmax_spec = _runtime_twin_spec(state, "softmax")
     if softmax_spec is not None:
         softmax = quantize_dequant_softmax_twin(
             softmax,
             float(softmax_spec.get("range1_max", 1.0)),
         ).astype(np.float32)
-    attn_v = np.matmul(softmax, v).astype(np.float32)
+    # attn@V as a SEQUENTIAL FP32 fold over k (matches the RTL accumulator),
+    # not numpy's pairwise matmul.
+    prod = (softmax[:, :, None] * v[None, :, :]).astype(np.float32)
+    attn_v = np.add.accumulate(prod, axis=1, dtype=np.float32)[:, -1, :].astype(np.float32)
 
-    if out_scale == np.float32(0):
-        result = np.zeros((M, N), dtype=np.int8)
-    else:
-        result = np.clip(np.round(attn_v / out_scale), -128, 127).astype(np.int8)
+    result = fpr.fp32_quantize_i8_arr(attn_v, out_scale)
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
 
-    if softmax_trace_scale == np.float32(0):
-        softmax_i8 = np.zeros((M, K), dtype=np.int8)
-    else:
-        softmax_i8 = np.clip(np.round(softmax / softmax_trace_scale), -128, 127).astype(np.int8)
+    softmax_i8 = fpr.fp32_quantize_i8_arr(softmax, softmax_trace_scale)
 
     state.cycle_count += (M * K * CYCLE_PER_ELEMENT) + (m_tiles * n_tiles * k_tiles * 16) + (M * N)
     return {
