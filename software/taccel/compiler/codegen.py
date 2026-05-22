@@ -8,32 +8,25 @@ from ..isa.instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
     DequantAddInsn,
     SoftmaxAttnVInsn,
-    LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
-    ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
+    LoadInsn, StoreInsn, BufCopyInsn,
+    ConfigTileInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
 from .ir import IRNode, IRGraph
 from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
 from .graph_extract import NUM_PATCHES, EMBED_DIM
+from .sreg_allocator import SRegAllocator
+from .scale_emitter import fp16_to_uint16, emit_scale, emit_scale_pair
+from .dma_emitter import set_addr
 
 UNIT = 16
 
-
-def _fp16_to_uint16(val: float) -> int:
-    """Convert FP32 value to FP16 bit pattern as uint16 (little-endian)."""
-    fp16 = np.float16(val)
-    # tobytes() on little-endian system gives LE bytes; interpret as uint16
-    return int(np.frombuffer(fp16.tobytes(), dtype=np.uint16)[0])
-
-
-def _set_addr(addr_reg: int, byte_addr: int) -> List[Instruction]:
-    """Emit SET_ADDR_LO + SET_ADDR_HI to set a 56-bit DRAM address."""
-    lo = byte_addr & 0xFFFFFFF
-    hi = (byte_addr >> 28) & 0xFFFFFFF
-    return [
-        SetAddrLoInsn(addr_reg=addr_reg, imm28=lo),
-        SetAddrHiInsn(addr_reg=addr_reg, imm28=hi),
-    ]
+# DeiT-tiny sequence length is 197 tokens; we pad to 208 = 13 × 16 so M aligns
+# to the systolic tile size. The 11 trailing rows are zero in the input but
+# LN(zero_row) = beta (non-zero), which would leak through QKV projections.
+# We zero K/V rows 197–207 explicitly via DMA from this constant block to
+# eliminate the beta-derived attention contribution from padding tokens.
+PAD_ROWS = 208 - 197  # = 11
 
 
 class CodeGenerator:
@@ -74,9 +67,7 @@ class CodeGenerator:
         self.instructions: List[Instruction] = []
         self.dram_layout: Dict[str, int] = {}  # name → dram byte offset
         self.dram_blob = bytearray()
-        self.next_sreg_single = 0  # index into odd sreg pool (1,3,5,...)
-        self.next_sreg_pair = 0    # index into even sreg pool (0,2,4,...)
-        self.next_sreg_quad = 0    # index into quadruplet pool (0,4,8,12)
+        self.sregs = SRegAllocator()
         # Track node outputs that live in DRAM temp (from strip-mined spills)
         # Maps output_name → DRAM byte offset of the spilled data
         self.dram_temp_outputs: Dict[str, int] = {}
@@ -153,12 +144,10 @@ class CodeGenerator:
             self.dram_blob.extend(blob)
             offset += len(blob)
 
-        # Zero-pad blob: used to mask attention padding rows (K and V) before QKT.
-        # Padding rows 197-207 are zero in the input but LN(zero_row) = beta (non-zero),
-        # which propagates through QKV projections. Zeroing K/V rows 197-207 eliminates
-        # the beta-derived attention contribution from padding tokens.
-        # Size: 11 padding rows × 64 bytes (head_dim, which equals K_pad) = 704 bytes.
-        _zero_pad_size = 11 * 64
+        # Zero-pad blob: PAD_ROWS rows × 64 bytes (= head_dim, which equals K_pad),
+        # used to mask attention padding rows in K and V before QKT. See PAD_ROWS
+        # docstring at the top of this module for why this is needed.
+        _zero_pad_size = PAD_ROWS * 64
         self.dram_layout["__zero_pad__"] = offset
         self.dram_blob.extend(bytes(_zero_pad_size))
         offset += _zero_pad_size
@@ -175,35 +164,6 @@ class CodeGenerator:
         # Pad DRAM to alignment
         while len(self.dram_blob) % UNIT != 0:
             self.dram_blob.append(0)
-
-    def _alloc_sreg(self) -> int:
-        """Allocate a single scale register from the odd pool (1,3,5,7,9,11,13).
-
-        Singles and pairs use separate pools so they never overwrite each other.
-        Scale registers are set immediately before use so wrapping is safe.
-        """
-        ODD_POOL = [1, 3, 5, 7, 9, 11, 13]
-        reg = ODD_POOL[self.next_sreg_single % len(ODD_POOL)]
-        self.next_sreg_single = (self.next_sreg_single + 1) % len(ODD_POOL)
-        return reg
-
-    def _alloc_sreg_pair(self) -> int:
-        """Allocate a consecutive pair of scale registers from the even pool (0,2,4,...,12).
-
-        Returns the lower (even) register; caller uses (reg, reg+1).
-        Pairs and singles use separate pools so they never overwrite each other.
-        """
-        PAIR_POOL = [0, 2, 4, 6, 8, 10, 12]
-        reg = PAIR_POOL[self.next_sreg_pair % len(PAIR_POOL)]
-        self.next_sreg_pair = (self.next_sreg_pair + 1) % len(PAIR_POOL)
-        return reg
-
-    def _alloc_sreg_quad(self) -> int:
-        """Allocate four consecutive scale registers."""
-        QUAD_POOL = [0, 4, 8, 12]
-        reg = QUAD_POOL[self.next_sreg_quad % len(QUAD_POOL)]
-        self.next_sreg_quad = (self.next_sreg_quad + 1) % len(QUAD_POOL)
-        return reg
 
     def _emit(self, insn: Instruction):
         self.instructions.append(insn)
@@ -535,8 +495,8 @@ class CodeGenerator:
             self.mem.wbuf.free(f"_rqpc_{weight_name}")
         else:
             requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
-            sreg = self._alloc_sreg()
-            self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+            sreg = self.sregs.alloc_single()
+            self._emit(emit_scale(sreg, requant_scale_f))
             self._emit(RequantInsn(
                 src1_buf=BUF_ACCUM, src1_off=0,
                 dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
@@ -672,8 +632,8 @@ class CodeGenerator:
                 scale_mul = head_scale / max(concat_scale, 1e-12)
                 if not np.isclose(scale_mul, 1.0, atol=1e-4, rtol=1e-4):
                     self._emit(ConfigTileInsn(M=0, N=head_dim_pad // TILE - 1, K=0))
-                    scale_sreg = self._alloc_sreg()
-                    self._emit(SetScaleInsn(sreg=scale_sreg, src_mode=0, imm16=_fp16_to_uint16(scale_mul)))
+                    scale_sreg = self.sregs.alloc_single()
+                    self._emit(emit_scale(scale_sreg, scale_mul))
                     self._emit(ScaleMulInsn(
                         src1_buf=BUF_ABUF, src1_off=head_strip_alloc.offset_units,
                         dst_buf=BUF_ABUF, dst_off=head_strip_alloc.offset_units,
@@ -714,9 +674,8 @@ class CodeGenerator:
                     full_rows=M,
                     full_cols=N,
                 )
-                dequant_sreg = self._alloc_sreg_pair()
-                self._emit(SetScaleInsn(sreg=dequant_sreg, src_mode=0, imm16=_fp16_to_uint16(accum_rescale)))
-                self._emit(SetScaleInsn(sreg=dequant_sreg + 1, src_mode=0, imm16=_fp16_to_uint16(skip_rescale)))
+                dequant_sreg = self.sregs.alloc_pair()
+                self.instructions.extend(emit_scale_pair(dequant_sreg, accum_rescale, skip_rescale))
                 self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
                 skip_strip_off = skip_alloc.offset_units + (s * strip_rows * N_pad) // UNIT
                 self._emit(DequantAddInsn(
@@ -753,8 +712,8 @@ class CodeGenerator:
                 else:
                     mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
                     requant_scale_f = concat_scale * mean_w_scale / max(target_act_scale, 1e-12)
-                    sreg = self._alloc_sreg()
-                    self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+                    sreg = self.sregs.alloc_single()
+                    self._emit(emit_scale(sreg, requant_scale_f))
                     self._emit(RequantInsn(
                         src1_buf=BUF_ACCUM, src1_off=0,
                         dst_buf=BUF_ABUF, dst_off=strip_out_off,
@@ -912,16 +871,13 @@ class CodeGenerator:
                 f"{node.name}_strip{s}", strip_rows * N_pad).offset_units
 
             if self._gelu_from_accum_enabled_for(node, gelu_name):
-                gelu_sreg = self._alloc_sreg_pair()
+                gelu_sreg = self.sregs.alloc_pair()
                 # FC1 uses per-tensor quantization, so mean_w_scale is the exact
                 # accumulator-domain real-value scale for all output channels.
                 mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
                 gelu_in_scale = input_act_scale * mean_w_scale
                 gelu_out_scale = self.calibration_scales.get(gelu_name, 1.0 / 127.0)
-                self._emit(SetScaleInsn(sreg=gelu_sreg, src_mode=0,
-                                        imm16=_fp16_to_uint16(gelu_in_scale)))
-                self._emit(SetScaleInsn(sreg=gelu_sreg + 1, src_mode=0,
-                                        imm16=_fp16_to_uint16(gelu_out_scale)))
+                self.instructions.extend(emit_scale_pair(gelu_sreg, gelu_in_scale, gelu_out_scale))
                 self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
                 self._emit(GeluInsn(
                     src1_buf=BUF_ACCUM, src1_off=0,
@@ -958,9 +914,8 @@ class CodeGenerator:
                     full_rows=M,
                     full_cols=N,
                 )
-                dequant_sreg = self._alloc_sreg_pair()
-                self._emit(SetScaleInsn(sreg=dequant_sreg, src_mode=0, imm16=_fp16_to_uint16(accum_rescale)))
-                self._emit(SetScaleInsn(sreg=dequant_sreg + 1, src_mode=0, imm16=_fp16_to_uint16(skip_rescale)))
+                dequant_sreg = self.sregs.alloc_pair()
+                self.instructions.extend(emit_scale_pair(dequant_sreg, accum_rescale, skip_rescale))
                 self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
                 skip_strip_off = skip_alloc.offset_units + (s * strip_rows * N_pad) // UNIT
                 self._emit(DequantAddInsn(
@@ -995,8 +950,8 @@ class CodeGenerator:
                     # Requantize strip: scale = input_act_scale × mean(weight_scale) / target_act_scale
                     mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
                     requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
-                    sreg = self._alloc_sreg()
-                    self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+                    sreg = self.sregs.alloc_single()
+                    self._emit(emit_scale(sreg, requant_scale_f))
 
                     self._emit(RequantInsn(
                         src1_buf=BUF_ACCUM, src1_off=0,
@@ -1019,13 +974,10 @@ class CodeGenerator:
                 )
 
                 if gelu_name:
-                    gelu_sreg = self._alloc_sreg_pair()
+                    gelu_sreg = self.sregs.alloc_pair()
                     gelu_in_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
                     gelu_out_scale = self.calibration_scales.get(gelu_name, 1.0 / 127.0)
-                    self._emit(SetScaleInsn(sreg=gelu_sreg, src_mode=0,
-                                            imm16=_fp16_to_uint16(gelu_in_scale)))
-                    self._emit(SetScaleInsn(sreg=gelu_sreg + 1, src_mode=0,
-                                            imm16=_fp16_to_uint16(gelu_out_scale)))
+                    self.instructions.extend(emit_scale_pair(gelu_sreg, gelu_in_scale, gelu_out_scale))
                     self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
                     self._emit(GeluInsn(
                         src1_buf=BUF_ABUF, src1_off=strip_out_off,
@@ -1311,11 +1263,13 @@ class CodeGenerator:
 
             if fused_softmax_attnv:
                 self._emit(ConfigTileInsn(M=0, N=k_tiles - 1, K=n_tiles - 1))
-                sreg = self._alloc_sreg_quad()
-                self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(qkt_in_scale)))
-                self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(v_scale)))
-                self._emit(SetScaleInsn(sreg=sreg + 2, src_mode=0, imm16=_fp16_to_uint16(target_act_scale)))
-                self._emit(SetScaleInsn(sreg=sreg + 3, src_mode=0, imm16=_fp16_to_uint16(softmax_out_scale)))
+                sreg = self.sregs.alloc_quad()
+                self.instructions.extend([
+                    emit_scale(sreg, qkt_in_scale),
+                    emit_scale(sreg + 1, v_scale),
+                    emit_scale(sreg + 2, target_act_scale),
+                    emit_scale(sreg + 3, softmax_out_scale),
+                ])
                 strip_out_off = attn_v_alloc.offset_units + (s * TILE * K_pad) // UNIT
                 self._emit(SoftmaxAttnVInsn(
                     src1_buf=BUF_ACCUM, src1_off=0,
@@ -1359,11 +1313,8 @@ class CodeGenerator:
             else:
                 # C1: SOFTMAX directly from ACCUM to avoid QKT INT8 bottleneck.
                 # in_scale dequants INT32 accumulators; out_scale quantizes probabilities.
-                sreg = self._alloc_sreg_pair()
-                self._emit(SetScaleInsn(sreg=sreg, src_mode=0,
-                                        imm16=_fp16_to_uint16(qkt_in_scale)))
-                self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0,
-                                        imm16=_fp16_to_uint16(softmax_out_scale)))
+                sreg = self.sregs.alloc_pair()
+                self.instructions.extend(emit_scale_pair(sreg, qkt_in_scale, softmax_out_scale))
                 strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * M_pad) // UNIT
                 self._emit(SoftmaxInsn(
                     src1_buf=BUF_ACCUM, src1_off=0,
@@ -1489,8 +1440,8 @@ class CodeGenerator:
         v_scale = self.calibration_scales.get(node.inputs[1], 6.0 / 127.0)
         target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
         requant_scale_f = attn_scale * v_scale / max(target_act_scale, 1e-12)
-        sreg = self._alloc_sreg()
-        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+        sreg = self.sregs.alloc_single()
+        self._emit(emit_scale(sreg, requant_scale_f))
         out_alloc = self.mem.wbuf.alloc(node.name, M_pad * N_pad)
         self._emit(RequantInsn(
             src1_buf=BUF_ACCUM, src1_off=0,
@@ -1613,11 +1564,10 @@ class CodeGenerator:
         n_tiles = N_pad // TILE
         self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
 
-        sreg = self._alloc_sreg_pair()
+        sreg = self.sregs.alloc_pair()
         in_scale = self.calibration_scales.get(node.inputs[0], 1.0 / 127.0)
         out_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
-        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
-        self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
+        self.instructions.extend(emit_scale_pair(sreg, in_scale, out_scale))
 
         in_alloc = self.mem.abuf.get(node.inputs[0]) or \
                    self.mem.abuf.alloc(node.inputs[0], M_pad * N_pad)
@@ -1648,11 +1598,10 @@ class CodeGenerator:
         n_tiles = N_pad // TILE
         self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
 
-        sreg = self._alloc_sreg_pair()
+        sreg = self.sregs.alloc_pair()
         in_scale = self.calibration_scales.get(node.inputs[0], 1.0 / 127.0)
         out_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
-        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
-        self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
+        self.instructions.extend(emit_scale_pair(sreg, in_scale, out_scale))
 
         # Load gamma/beta to WBUF
         gamma_name = node.inputs[1]
@@ -1768,9 +1717,8 @@ class CodeGenerator:
             skip_scale = self.calibration_scales.get(skip_name, 6.0 / 127.0)
             accum_rescale = pending["accum_real_scale"] / max(output_scale, 1e-12)
             skip_rescale = skip_scale / max(output_scale, 1e-12)
-            sreg = self._alloc_sreg_pair()
-            self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(accum_rescale)))
-            self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(skip_rescale)))
+            sreg = self.sregs.alloc_pair()
+            self.instructions.extend(emit_scale_pair(sreg, accum_rescale, skip_rescale))
             self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
             self._emit(DequantAddInsn(
                 src1_buf=BUF_ACCUM, src1_off=0,
@@ -1988,7 +1936,7 @@ class CodeGenerator:
     def _emit_dma_load(self, buf_id: int, sram_off_units: int, size_bytes: int,
                        addr_reg: int, dram_byte_offset: int):
         """Emit SET_ADDR + LOAD sequence."""
-        self.instructions.extend(_set_addr(addr_reg, dram_byte_offset))
+        self.instructions.extend(set_addr(addr_reg, dram_byte_offset))
         xfer_units = (size_bytes + UNIT - 1) // UNIT
         self._emit(LoadInsn(
             buf_id=buf_id,
@@ -2001,7 +1949,7 @@ class CodeGenerator:
     def _emit_dma_store(self, buf_id: int, sram_off_units: int, size_bytes: int,
                         addr_reg: int, dram_byte_offset: int):
         """Emit SET_ADDR + STORE sequence."""
-        self.instructions.extend(_set_addr(addr_reg, dram_byte_offset))
+        self.instructions.extend(set_addr(addr_reg, dram_byte_offset))
         xfer_units = (size_bytes + UNIT - 1) // UNIT
         self._emit(StoreInsn(
             buf_id=buf_id,

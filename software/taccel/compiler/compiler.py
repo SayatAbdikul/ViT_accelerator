@@ -14,6 +14,13 @@ from .codegen import CodeGenerator
 from .tiler import pad_dim
 
 
+# Fallback activation scale used when calibration data doesn't cover a node.
+# 6.0/127 ≈ 0.047 — assumes the activation max-abs sits near 6.0 (typical for
+# post-LayerNorm transformer features). Used by ~16 call sites that pull from
+# the calibration dict with .get(key, DEFAULT_ACTIVATION_SCALE).
+DEFAULT_ACTIVATION_SCALE = 6.0 / 127.0
+
+
 class Compiler:
     """Compile a DeiT-tiny model to ProgramBinary."""
 
@@ -275,7 +282,7 @@ class Compiler:
         # wrong attention scores (e.g. 100% CLS-self instead of ~21%).
         for layer_idx in range(12):
             prefix = f"vit.encoder.layer.{layer_idx}"
-            ln1_scale = cal_scales.get(f"block{layer_idx}_ln1", 6.0 / 127.0)
+            ln1_scale = cal_scales.get(f"block{layer_idx}_ln1", DEFAULT_ACTIVATION_SCALE)
             for proj in ["query", "key", "value"]:
                 wname = f"{prefix}.attention.attention.{proj}.weight"
                 if wname not in state_dict:
@@ -329,7 +336,7 @@ class Compiler:
                     if use_requant_pc_qkv:
                         target_act_scale = cal_scales.get(
                             f"block{layer_idx}_head{h}_{proj}",
-                            6.0 / 127.0,
+                            DEFAULT_ACTIVATION_SCALE,
                         )
                         requant_pc_weight_names.add(head_weight_name)
                         requant_pc_scale_tables[head_weight_name] = (
@@ -371,7 +378,7 @@ class Compiler:
                 bname = f"{prefix}.{dense_name}.bias"
                 if wname not in state_dict:
                     continue
-                act_scale_b = cal_scales.get(input_scale_key, 6.0 / 127.0)
+                act_scale_b = cal_scales.get(input_scale_key, DEFAULT_ACTIVATION_SCALE)
                 override_quant = (weight_quantization_overrides or {}).get(wname)
                 if dense_name == "attention.output.dense" and (
                     not requant_pc_out_proj
@@ -386,7 +393,7 @@ class Compiler:
                     if w_scales is None:
                         raise KeyError(f"Missing per-channel scales for REQUANT_PC weight '{wname}'")
                     w_scales_fp32 = w_scales.astype(np.float32)
-                    target_act_scale = cal_scales.get(output_scale_key, 6.0 / 127.0)
+                    target_act_scale = cal_scales.get(output_scale_key, DEFAULT_ACTIVATION_SCALE)
                     requant_pc_weight_names.add(wname)
                     requant_pc_scale_tables[wname] = (
                         np.float32(act_scale_b) * w_scales_fp32 / max(target_act_scale, 1e-12)
@@ -484,7 +491,7 @@ class Compiler:
                     "classifier.bias",
                     bias_corrections,
                 )
-                act_scale_b = cal_scales.get("cls_extract", 6.0 / 127.0)
+                act_scale_b = cal_scales.get("cls_extract", DEFAULT_ACTIVATION_SCALE)
                 bias_i32 = self.scale_prop.prescale_bias(
                     bias_fp32,
                     np.array([act_scale_b], dtype=np.float32),
@@ -640,7 +647,7 @@ class Compiler:
         """Generate default calibration scales from weight statistics."""
         scales = {}
         # Default activation scale based on typical transformer activations
-        default_scale = 6.0 / 127.0  # ~6 max abs is typical
+        default_scale = DEFAULT_ACTIVATION_SCALE  # ~6 max abs is typical
         for name in state_dict:
             scales[name] = default_scale
             scales[f"{name}_input"] = default_scale
@@ -666,7 +673,7 @@ class Compiler:
                           bias_corrections: Optional[Dict[str, np.ndarray]] = None) -> Dict[str, np.ndarray]:
         """Pre-scale biases to INT32."""
         prescaled = {}
-        default_act_scale = 6.0 / 127.0
+        default_act_scale = DEFAULT_ACTIVATION_SCALE
 
         for name, tensor in state_dict.items():
             if 'bias' not in name:
