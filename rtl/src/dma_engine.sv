@@ -124,16 +124,6 @@ module dma_engine
   logic        dispatch_dram_oob_w;
   logic        dispatch_sram_oob_w;
 
-  function automatic logic [15:0] buf_rows(input logic [1:0] bid);
-    begin
-      case (bid)
-        BUF_ABUF:  buf_rows = 16'(ABUF_ROWS);
-        BUF_WBUF:  buf_rows = 16'(WBUF_ROWS);
-        BUF_ACCUM: buf_rows = 16'(ACCUM_ROWS);
-        default:   buf_rows = 16'h0;
-      endcase
-    end
-  endfunction
 
   function automatic logic [15:0] burst_beats(input logic [15:0] remaining);
     begin

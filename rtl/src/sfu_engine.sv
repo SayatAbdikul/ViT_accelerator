@@ -175,16 +175,6 @@ module sfu_engine
   logic [127:0] gelu_i32_write_data_w;
   logic [127:0] attn_write_data_w;
 
-  function automatic logic [15:0] buf_rows(input logic [1:0] bid);
-    begin
-      case (bid)
-        BUF_ABUF:  buf_rows = 16'(ABUF_ROWS);
-        BUF_WBUF:  buf_rows = 16'(WBUF_ROWS);
-        BUF_ACCUM: buf_rows = 16'(ACCUM_ROWS);
-        default:   buf_rows = 16'h0;
-      endcase
-    end
-  endfunction
 
   // FP16 widening and INT->FP32 conversions live in fp32_prim_pkg
   // (fp32_from_fp16_bits / fp32_from_i8 / fp32_from_i32). The legacy

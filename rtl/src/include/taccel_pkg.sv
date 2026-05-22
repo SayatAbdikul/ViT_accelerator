@@ -184,16 +184,20 @@ package taccel_pkg;
   parameter int SYNC_SFU_BIT = 2;
 
   // -------------------------------------------------------------------------
-  // Erf polynomial coefficients (Abramowitz & Stegun 7.1.26) as FP32 bits
-  // Max absolute error < 5e-7 in FP32 — far below INT8 noise floor ~4e-3.
-  // Used by sfu_gelu in Phase 5.
+  // Per-buffer row count lookup. Used by dma_engine, blocking_helper_engine,
+  // and sfu_engine to bounds-check buffer accesses against the architectural
+  // *_ROWS parameters. Identical 5-line copies used to live in each of those
+  // modules; centralising here keeps the *_ROWS sizing single-sourced.
+  // Returns 0 on reserved buffer IDs so callers can OR-in an OOB fault.
   // -------------------------------------------------------------------------
-  parameter logic [31:0] ERF_A1 = 32'h3E827906;  //  0.254829592
-  parameter logic [31:0] ERF_A2 = 32'hBE91A98E;  // -0.284496736
-  parameter logic [31:0] ERF_A3 = 32'h3FB5D78E;  //  1.421413741
-  parameter logic [31:0] ERF_A4 = 32'hBFBA0005;  // -1.453152027
-  parameter logic [31:0] ERF_A5 = 32'h3F87DC22;  //  1.061405429
-  parameter logic [31:0] ERF_P  = 32'h3EA7B9D2;  //  0.3275911
+  function automatic logic [15:0] buf_rows(input logic [1:0] bid);
+    unique case (bid)
+      BUF_ABUF:  buf_rows = 16'(ABUF_ROWS);
+      BUF_WBUF:  buf_rows = 16'(WBUF_ROWS);
+      BUF_ACCUM: buf_rows = 16'(ACCUM_ROWS);
+      default:   buf_rows = 16'h0;
+    endcase
+  endfunction
 
 endpackage
 

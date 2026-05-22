@@ -1,13 +1,33 @@
-// Non-DPI FP32 primitives used while migrating the accelerator away from C
-// math helpers. This first slice keeps the existing real-valued engine
-// boundaries, but implements FP32 round/add/sub/mul in SystemVerilog by
-// explicitly rounding IEEE-754 double-precision real values into packed
-// single-precision bits with round-to-nearest-even semantics.
+// Synthesizable FP32 primitives for the TACCEL SFU and blocking-helper
+// engines. Every operation here is implemented with integer arithmetic on
+// IEEE-754 binary32 bit patterns — no SV `real`, no DPI-C, no vendor FP IP
+// — so the entire RTL/src tree synthesises onto FPGA. The grep gate at
+// `rtl/verilator/Makefile`'s SYNTH_BUILD target enforces this.
+//
+// The normative spec for every algorithm, constant, and intermediate
+// rounding point is `rtl/src/include/ARITH_CONTRACT.md`. The Python twin at
+// `software/taccel/utils/fp32_prim_ref.py` mirrors this package bit-for-bit
+// so the golden model is RTL-equivalent by construction (exact integer
+// logits — see software/tools/batch_compare_rtl_golden.py:141).
+//
+// File layout — two sections separated by the TRANSCENDENTAL banner below:
+//   1. BASIC ARITH (Phase 0–2, stable):   pack/decode helpers, predicates,
+//        fp32_round/add/sub/mul_bits, integer ↔ FP32 widening, FP16 → FP32.
+//   2. TRANSCENDENTAL & QUANTIZE (Phase 3–4, may grow for Phase 5
+//        pipelining): fp32_div_bits, sqrt, exp, erf, gelu, quantize_i8,
+//        and their constants (FP32_ONE, FP32_EC*, FP32_ERF_*).
 
 `ifndef FP32_PRIM_PKG_SV
 `define FP32_PRIM_PKG_SV
 
 package fp32_prim_pkg;
+
+  // =====================================================================
+  // SECTION 1: BASIC ARITH (Phase 0–2, stable)
+  //   Types, predicates, IEEE-754 pack/decode helpers, and the four basic
+  //   ops (round/add/sub/mul). Everything here is correctly rounded.
+  // =====================================================================
+
   typedef logic [31:0] fp32_t;
   typedef logic [63:0] fp64_t;
   typedef longint unsigned u64_t;
@@ -303,9 +323,15 @@ package fp32_prim_pkg;
   endfunction
 
   // =====================================================================
-  // Synthesizable transcendental / division primitives (no `real`, no DPI).
-  // Spec: rtl/src/include/ARITH_CONTRACT.md. Bit patterns are frozen to
-  // match software/taccel/utils/fp32_prim_ref.py exactly.
+  // SECTION 2: TRANSCENDENTAL & QUANTIZE (Phase 3–4, may grow for Phase 5)
+  //   fp32_div_bits, fp32_sqrt_bits, fp32_exp_bits, fp32_erf_bits,
+  //   fp32_gelu_bits, fp32_quantize_i8_bits, plus their constants. These
+  //   are NOT correctly rounded — they're polynomial / Newton-Raphson
+  //   approximations co-defined with software/taccel/utils/fp32_prim_ref.py
+  //   so RTL ≡ golden by construction. Spec:
+  //   rtl/src/include/ARITH_CONTRACT.md. The 208-element combinational
+  //   loops that call these will be serialised in Phase 5; algorithms here
+  //   may be re-shaped (Horner ↔ tree, etc.) for timing closure.
   // =====================================================================
 
   localparam fp32_t FP32_ONE     = 32'h3F800000;
