@@ -1,7 +1,25 @@
-torch
-transformers
-Pillow
-requests
-numpy
-scipy
-datasets
+# Runtime dependencies for the TACCEL Python toolchain.
+# Pinned to >= the version exercised in CI so patch-level updates are still
+# accepted but breaking changes don't sneak in.
+
+# Core numerical stack
+numpy>=2.0,<3
+scipy>=1.13,<2
+
+# Image / network IO (for the dataset loaders and the HuggingFace processor)
+Pillow>=10,<13
+requests>=2.30,<3
+
+# Model loading and the HuggingFace DeiT processor used by the golden flow
+torch>=2.0,<3
+transformers>=4.40,<6
+datasets>=2.18,<5
+
+# ─── Test / development dependencies ──────────────────────────────────────────
+# Pin pytest to the major exercised in CI. cocotb-bus needs cocotb >= 1.7.
+# Verilator is not a Python dependency — install via the OS package manager
+# (apt / brew / dnf) or build from source; the cocotb tests select it via
+# `make -C rtl/cocotb SIM=verilator`.
+pytest>=8,<10
+cocotb>=1.7,<2
+cocotb-bus>=0.3,<1

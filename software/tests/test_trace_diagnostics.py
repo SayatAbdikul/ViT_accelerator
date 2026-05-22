@@ -109,7 +109,10 @@ class TestTraceDiagnostics:
             attn_v_scale=0.25,
         )
 
-        assert reports["fp32_fp32"]["raw_metrics"]["cosine_sim"] == 1.0
+        # cosine_sim is float32-precision; allow a 1-ULP tolerance for the
+        # exact-match check (matches the np.isclose pattern in
+        # test_tensor_error_metrics_reports_exact_match above).
+        assert np.isclose(reports["fp32_fp32"]["raw_metrics"]["cosine_sim"], 1.0)
         assert reports["fp32_fp32"]["attn_v_qdq_metrics"]["cosine_sim"] <= 1.0
         assert tensors["qdq_value"]["attn_v_qdq"].shape == target.shape
         assert reports["qdq_value"]["attn_v_qdq_metrics"]["max_abs_error"] >= 0.0

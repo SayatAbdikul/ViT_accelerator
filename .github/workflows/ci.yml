@@ -1,0 +1,82 @@
+# CI for the TACCEL accelerator project.
+#
+# Two jobs:
+#   python-tests   — pytest software/tests, skipping anything tagged
+#                    `requires_assets` (model weights + image dataset are
+#                    gitignored, so cloud CI can't run those). Runs on every
+#                    push and PR; the fast path.
+#   verilator      — installs Verilator and runs the SV synth-gate lint plus
+#                    the native fp32_prims / sfu / helpers / control test
+#                    binaries. Slower (~5 min) and only runs on push to main.
+#
+# Neither job runs the full cocotb suite or the batch RTL-vs-golden compare —
+# those need the gitignored DeiT-tiny weights and a frozen-image set, so they
+# stay in the manual sign-off path (see README.md "Common Commands").
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  python-tests:
+    name: pytest (no assets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r software/requirements.txt
+
+      - name: pytest (excluding asset-dependent and slow tests)
+        working-directory: software
+        run: |
+          pytest -q --no-header \
+            -m "not slow and not requires_assets" \
+            tests
+
+  verilator:
+    name: Verilator lint + native suites
+    runs-on: ubuntu-latest
+    # Verilator install is slow; only on push to main to keep PR feedback fast.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator
+          verilator --version
+
+      - name: SYNTH_BUILD lint gate
+        run: make -C rtl/verilator SYNTH_BUILD=1 lint
+
+      - name: fp32 primitives
+        run: make -C rtl/verilator test_fp32_prims
+
+      - name: SFU engine
+        run: make -C rtl/verilator test_sfu
+
+      - name: blocking helper engine
+        run: make -C rtl/verilator test_helpers
+
+      - name: control unit
+        run: make -C rtl/verilator test_control
+
+      - name: systolic array
+        run: make -C rtl/verilator test_systolic
+
+      - name: decode unit
+        run: make -C rtl/verilator test_decode
