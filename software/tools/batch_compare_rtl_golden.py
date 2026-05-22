@@ -80,15 +80,10 @@ def _load_processor(model_name: str):
     except OSError as exc:
         print(f"[batch_compare] Falling back to local DeiT processor: {exc}",
               file=sys.stderr)
-        # Import local fallback from compare_rtl_golden.py
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "compare_rtl_golden",
-            str(SCRIPT_DIR / "compare_rtl_golden.py"),
-        )
-        crg = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(crg)  # type: ignore[union-attr]
-        return crg._LocalDeiTProcessor()
+        # Local fallback lives in the sibling tool; import it as a package member
+        # now that software/tools/ is the single CLI boundary.
+        from tools.compare_rtl_golden import _LocalDeiTProcessor
+        return _LocalDeiTProcessor()
 
 
 def _cycle_budget(min_budget: int, golden_cycles: int) -> int:
@@ -175,7 +170,7 @@ def run_single_image(
     Patch-embed one image, run golden inference, run RTL, compare.
     Returns a result dict.
     """
-    import compare_golden as cg
+    from tools import benchmark_fp32_vs_int8 as cg
 
     img_work = work_dir / f"img_{idx:04d}"
     img_work.mkdir(parents=True, exist_ok=True)
@@ -383,7 +378,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    import compare_golden as cg
+    from tools import benchmark_fp32_vs_int8 as cg
 
     runner_path = Path(args.runner).resolve()
     if not runner_path.exists():

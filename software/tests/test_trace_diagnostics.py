@@ -4,7 +4,7 @@ import sys
 import numpy as np
 import pytest
 
-from compare_golden import (
+from tools.benchmark_fp32_vs_int8 import (
     main,
     quantization_diagnostics,
     replay_attention_head_variants,

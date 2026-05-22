@@ -7,7 +7,7 @@ from PIL import Image
 
 from taccel.quantizer.bias_correction import resolve_bias_correction_targets
 
-from compare_golden import (
+from tools.benchmark_fp32_vs_int8 import (
     CATS_DOGS_SAMPLE_IDS,
     CURRENT_BEST_SMOOTHQUANT_BLOCKS,
     DIAGNOSTIC_PRESETS,

@@ -18,9 +18,9 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from compare_golden import (
+from tools.benchmark_fp32_vs_int8 import (
     DIAGNOSTIC_PRESETS,
     FROZEN_EVAL_IMAGE_IDS,
     LOCAL_FROZEN_IMAGE_DIR,

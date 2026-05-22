@@ -26,7 +26,7 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoImageProcessor, AutoConfig, AutoModelForImageClassification
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from taccel.quantizer.fake_quant import (
     apply_weight_quantization,
     calibrate_activation_scales,

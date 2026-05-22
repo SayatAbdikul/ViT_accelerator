@@ -4423,7 +4423,7 @@ def compare_program_mode(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def compare_compile_mode(args: argparse.Namespace) -> dict[str, Any]:
-    import compare_golden as cg
+    from tools import benchmark_fp32_vs_int8 as cg
 
     runner_path = Path(args.runner).resolve()
     _ensure_runner_built(runner_path, rebuild=args.rebuild_runner)

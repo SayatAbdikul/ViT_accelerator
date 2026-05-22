@@ -12,7 +12,7 @@ sys.path.insert(0, str(SOFTWARE_DIR))
 
 from transformers import AutoImageProcessor
 
-from compare_golden import (
+from tools.benchmark_fp32_vs_int8 import (
     MODEL_NAME,
     compile_model,
     get_diagnostic_preset,

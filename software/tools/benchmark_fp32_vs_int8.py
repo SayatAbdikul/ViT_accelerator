@@ -26,7 +26,7 @@ from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoImageProcessor, AutoConfig, AutoModelForImageClassification
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from taccel.compiler.compiler import Compiler
 from taccel.compiler.graph_extract import (
@@ -3631,7 +3631,7 @@ def build_runtime_twin_uniform_manifest(
     twin_uniform_mode: str,
     block_replay_samples: dict,
 ):
-    """Build per-PC twin-uniform specs from compare_golden selections."""
+    """Build per-PC twin-uniform specs from benchmark_fp32_vs_int8 selections."""
     if twin_uniform_mode == "off":
         return {"mode": "off", "softmax": {}, "gelu": {}}
 

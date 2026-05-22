@@ -16,7 +16,7 @@ A complete Python toolchain for an INT8 transformer accelerator targeting **face
 8. [Utilities — `taccel/utils/`](#utilities)
 9. [CLI Tools — `tools/`](#cli-tools)
 10. [Tests — `tests/`](#tests)
-11. [Accuracy Comparison — `compare_accuracy.py`](#accuracy-comparison)
+11. [Accuracy Comparison — `tools/fake_quant_benchmark.py`](#accuracy-comparison)
 12. [Data Flow: end-to-end walkthrough](#data-flow-end-to-end)
 13. [Key Design Decisions](#key-design-decisions)
 14. [Quantization Results](#quantization-results)
@@ -29,7 +29,6 @@ A complete Python toolchain for an INT8 transformer accelerator targeting **face
 ```
 transformer_accelerator/
 ├── pytorch_model.bin          # DeiT-tiny FP32 weights (5.7 M params, gitignored)
-├── compare_accuracy.py        # FP32 vs INT8 accuracy benchmark
 │
 ├── taccel/                    # Main Python package
 │   ├── isa/                   # Instruction Set Architecture
@@ -68,11 +67,18 @@ transformer_accelerator/
 │       ├── int8_ops.py        # clip_int8, clip_int32, saturating add
 │       └── tensor_utils.py    # pad_to_multiple, tiles_for_dim, tile_coords
 │
-├── tools/
-│   ├── asm.py                 # CLI: .asm → .bin
-│   ├── disasm.py              # CLI: .bin → .asm
-│   ├── compile_model.py       # CLI: pytorch_model.bin → program.bin
-│   └── run_golden.py          # CLI: simulate program.bin
+├── tools/                     # All user-facing CLIs live here (no scripts at root)
+│   ├── asm.py                       # .asm → .bin
+│   ├── disasm.py                    # .bin → .asm
+│   ├── compile_model.py             # pytorch_model.bin → program.bin
+│   ├── run_golden.py                # simulate program.bin
+│   ├── compare_rtl_golden.py        # one-image RTL vs golden compare
+│   ├── batch_compare_rtl_golden.py  # batch driver for the above
+│   ├── benchmark_fp32_vs_int8.py    # FP32 vs INT8 golden benchmark (was compare_golden.py)
+│   ├── diagnose_block_ranges.py     # per-block range diagnostics (was diagnose_accuracy.py)
+│   ├── fake_quant_benchmark.py      # FP32 vs INT8 fake-quant baseline (was compare_accuracy.py)
+│   ├── export_model_asm.py          # dump assembly for a named preset
+│   └── extract_qkt_replay.py        # build a Q·K^T replay payload bundle
 │
 └── tests/
     ├── test_isa_encoding.py   # Encode/decode round-trips, all 17 types
@@ -312,7 +318,7 @@ The `add_observation` method keeps a running max so multiple batches can be proc
 
 ### `taccel/quantizer/fake_quant.py`
 
-Simulates INT8 inference inside the normal PyTorch forward pass by patching weights and optionally hooking activations. Used exclusively by `compare_accuracy.py`.
+Simulates INT8 inference inside the normal PyTorch forward pass by patching weights and optionally hooking activations. Used exclusively by `tools/fake_quant_benchmark.py`.
 
 **`apply_weight_quantization(model)`** — deep-copies the model, then for every `nn.Linear` / `nn.Conv2d` calls `_quantize_dequantize_weight`: quantize to INT8 with our exact scheme, immediately dequantize to FP32, replace `module.weight.data`. The resulting model runs normal FP32 arithmetic but with weight values constrained to the INT8 grid.
 
@@ -726,7 +732,7 @@ Round-trip `encode → decode → re-encode` for:
 
 ## Accuracy Comparison
 
-### `compare_accuracy.py`
+### `tools/fake_quant_benchmark.py`
 
 Tests the accuracy impact of our quantization scheme using **fake quantization** (quantize weights → dequantize back to FP32, then run normal PyTorch inference). Two experiments:
 

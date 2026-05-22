@@ -1,7 +1,7 @@
 """Tests for offline accuracy diagnostics helpers."""
 import numpy as np
 
-from diagnose_accuracy import (
+from tools.diagnose_block_ranges import (
     compare_attention_runtime_path,
     summarize_block_impact,
     summarize_late_attention_path_delta,
