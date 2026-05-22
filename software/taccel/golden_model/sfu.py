@@ -12,16 +12,18 @@ Precision spec (matches RTL target)
 
 GELU erf() implementation
 --------------------------
-The golden model uses scipy.special.erf (the C library's erf, accurate to
-ULP precision).  RTL should implement the Abramowitz & Stegun 7.1.26
-polynomial approximation (see ``_erf_poly`` below), which has max absolute
-error < 1.5e-7 — far below the INT8 quantization noise floor (~0.004).
+The golden model calls ``fp32_prim_ref.fp32_gelu_arr``, which implements
+the Abramowitz & Stegun 7.1.26 polynomial in FP32 with the same operation
+order and rounding points as the synthesizable RTL ``fp32_gelu_bits``.
+This makes RTL ≡ golden bit-exact by construction; the exact-logit gate at
+``software/tools/batch_compare_rtl_golden.py:141`` is the load-bearing
+invariant.
 
-The polynomial approximation is provided as ``_erf_poly()`` for RTL
-reference and verification.  In FP32 arithmetic the max absolute error is
-~5e-7 (the 1.5e-7 figure from A&S applies to FP64).  Both implementations
-produce identical INT8 output for all inputs encountered in the DeiT-tiny
-workload.
+``_erf_poly()`` below is the reference Python expression of the same
+polynomial used in fp32_prim_ref and RTL.  It is exercised directly by
+``software/tests/test_golden_model.py::test_erf_poly_matches_scipy_for_int8``
+and ``test_erf_poly_max_fp32_error`` as a precision check against scipy;
+it is not on the execute_gelu path.
 """
 import numpy as np
 from . import memory
@@ -183,9 +185,8 @@ def execute_gelu(state, insn):
 
     GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
 
-    All arithmetic in FP32. RTL implements erf via polynomial approximation
-    (see _erf_poly).  The golden model uses scipy.special.erf for reference
-    precision; both produce identical INT8 output.
+    All arithmetic in FP32 via fp32_prim_ref.fp32_gelu_arr (A&S 7.1.26
+    polynomial), bit-exact to the RTL fp32_gelu_bits primitive.
     """
     from .simulator import ConfigError
     if state.tile_config is None:

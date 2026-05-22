@@ -28,8 +28,7 @@ A complete Python toolchain for an INT8 transformer accelerator targeting **face
 
 ```
 transformer_accelerator/
-├── pytorch_model.bin          # DeiT-tiny FP32 weights (5.7 M params)
-├── run_deit.py                # Vanilla FP32 HuggingFace inference
+├── pytorch_model.bin          # DeiT-tiny FP32 weights (5.7 M params, gitignored)
 ├── compare_accuracy.py        # FP32 vs INT8 accuracy benchmark
 │
 ├── taccel/                    # Main Python package
@@ -548,7 +547,7 @@ If `sreg = 15`, raises `ConfigError("SFU sreg+1 out of range")`. The compiler al
 |-----|--------------|
 | **LAYERNORM** | reads γ/β from `src2` as FP16 pairs; `y = (x − μ) / √(σ²+ε) × γ + β` |
 | **SOFTMAX** | numerically stable: `exp(x − max(x)) / Σexp(x − max(x))` |
-| **GELU** | `x × 0.5 × (1 + erf(x / √2))` via `scipy.special.erf` |
+| **GELU** | `x × 0.5 × (1 + erf(x / √2))` via the deterministic Abramowitz & Stegun 7.1.26 polynomial in `fp32_prim_ref.fp32_gelu_arr` (bit-exact match to RTL `fp32_gelu_bits`) |
 
 Cycle cost: 2 cycles per element.
 

@@ -2,7 +2,7 @@
 obj_dir/
 .pytest_cache/
 .mypy_cache/
-__pycache__/
+**/__pycache__/
 .coverage
 coverage.xml
 .DS_Store
@@ -12,3 +12,14 @@ coverage.xml
 venv/
 env/
 .claude/
+
+# Session scratchpads
+session.txt
+
+# Build artifacts and generated outputs
+software/out/
+rtl/verilator/build/
+rtl/cocotb/sim_build/
+rtl/cocotb/results.xml
+*.vcd
+dump.*

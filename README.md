@@ -134,20 +134,32 @@ programs through the Verilator runner. The debug infrastructure can emit
 snapshots, SRAM write logs, systolic traces, and replay payloads to isolate
 first divergences against the golden model.
 
-Current numerical caveat:
+Current numerical and synthesis status:
 
-- Four simple FP32 helpers have been migrated away from DPI-C:
-  `round`, `add`, `sub`, and `mul`.
-- The harder SFU helpers still use DPI-C in simulation:
-  `div`, `sqrt`, `exp`, `gelu`, and `quantize_i8`.
-- Strict raw-logit exactness is sensitive to one-LSB SFU rounding artifacts.
-  The compare flow distinguishes raw mismatches from effective/passable
-  divergences when provenance proves the mismatch is nonblocking scratch state
-  or a tiny rounding artifact.
+- All FP32 SFU helpers are now synthesizable SystemVerilog. The full set —
+  `round`, `add`, `sub`, `mul`, `div`, `sqrt`, `exp`, `erf`, `gelu`,
+  `quantize_i8`, and `from_fp16` — lives in
+  `rtl/src/include/fp32_prim_pkg.sv` as bit-exact `fp32_*_bits` functions.
+  The normative spec is `rtl/src/include/ARITH_CONTRACT.md`.
+- The grep gate at `rtl/verilator/Makefile`'s `synth_gate` target enforces
+  that `rtl/src/` (excluding `rtl/src/tb/`) contains no `DPI-C` imports,
+  no `real` types, and none of `$realtobits`/`$bitstoreal`/`$rtoi`/`$itor`.
+- RTL is bit-exact-equivalent to the golden model by construction:
+  `software/taccel/golden_model/sfu.py` calls `software/taccel/utils/fp32_prim_ref.py`,
+  which implements the same algorithms as the RTL `fp32_*_bits` package using
+  sequential FP32 left-folds. The sign-off invariant is exact integer logit
+  equality at `software/tools/batch_compare_rtl_golden.py:141`
+  (`raw_logits_exact = golden_logits == rtl_logits`, zero tolerance).
 
-This means the codebase is strong as a research/prototype accelerator and
-verification platform, but it is not yet a synthesis-ready, fully DPI-free
-implementation.
+Remaining work for FPGA bring-up (documented as future work, not in `main`):
+
+- **SFU FSM serialization** — the `F_ROW_COMPUTE`, `F_ATTN_PREP`, and
+  `F_ATTN_V_LATCH` states in `rtl/src/sfu_engine.sv` still execute 208-element
+  computations combinationally. They must be broken into element-serial
+  sub-states sharing one FP datapath instance before timing can close on FPGA.
+- **Vivado synthesis dry-run** and target-clock closure (≈300–400 MHz
+  UltraScale+ realistic for FP32 div/sqrt). Portable RTL only — no vendor FP
+  IP, since vendor rounding would break the exact-logit contract.
 
 ## Setup
 
@@ -298,6 +310,6 @@ drop-in finished LLM accelerator.
 - `software/CODEBASE.md`: detailed software stack walkthrough.
 - `rtl/TESTBENCHES.md`: RTL testbench ownership and commands.
 - `docs/rtl_plan.md`: hardware/software contract and RTL roadmap.
-- `docs/rtl_synthesis_plan.md`: synthesis-oriented planning notes.
+- `docs/archive/rtl_synthesis_plan_phase0-4_COMPLETED.md`: synthesis-oriented planning notes from the Phase 0–4 DPI/`real` migration (now complete).
 - `software/docs/isa_spec.md`: ISA details.
 
