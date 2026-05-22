@@ -1,7 +1,7 @@
 """Encode instructions to bytes and decode bytes to instructions."""
 import struct
 from .opcodes import (
-    Opcode, InsnFormat, OPCODE_FORMAT,
+    Opcode, InsnFormat, OPCODE_FORMAT, ISA_SPEC,
     OPCODE_SHIFT, OPCODE_MASK,
     R_SRC1_BUF_SHIFT, R_SRC1_OFF_SHIFT, R_SRC2_BUF_SHIFT, R_SRC2_OFF_SHIFT,
     R_DST_BUF_SHIFT, R_DST_OFF_SHIFT, R_SREG_SHIFT, R_FLAGS_SHIFT,
@@ -15,37 +15,23 @@ from .opcodes import (
     SYNC_RESOURCE_MASK_SHIFT,
     MASK_2BIT, MASK_3BIT, MASK_4BIT, MASK_6BIT, MASK_10BIT, MASK_16BIT, MASK_28BIT,
 )
+# instructions must be imported so its @register_insn decorators have run
+# before we derive the per-format dispatch tables below.
+from . import instructions as _instructions  # noqa: F401
 from .instructions import (
-    Instruction, RTypeInsn, MTypeInsn, BufCopyInsn, ATypeInsn, ConfigTileInsn,
+    Instruction, BufCopyInsn, ConfigTileInsn,
     SetScaleInsn, SyncInsn, NopInsn, HaltInsn,
-    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
-    SoftmaxAttnVInsn, DequantAddInsn,
-    LoadInsn, StoreInsn, SetAddrLoInsn, SetAddrHiInsn,
 )
 
-# Map opcode to concrete R-type class
-_R_TYPE_CLASSES = {
-    Opcode.MATMUL: MatmulInsn,
-    Opcode.REQUANT: RequantInsn,
-    Opcode.REQUANT_PC: RequantPcInsn,
-    Opcode.SCALE_MUL: ScaleMulInsn,
-    Opcode.VADD: VaddInsn,
-    Opcode.SOFTMAX: SoftmaxInsn,
-    Opcode.LAYERNORM: LayernormInsn,
-    Opcode.GELU: GeluInsn,
-    Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
-    Opcode.DEQUANT_ADD: DequantAddInsn,
-}
 
-_M_TYPE_CLASSES = {
-    Opcode.LOAD: LoadInsn,
-    Opcode.STORE: StoreInsn,
-}
+def _classes_for_format(fmt: InsnFormat) -> dict:
+    """Per-format opcode→class dispatch derived from ISA_SPEC."""
+    return {op: e.insn_class for op, e in ISA_SPEC.items() if e.format == fmt}
 
-_A_TYPE_CLASSES = {
-    Opcode.SET_ADDR_LO: SetAddrLoInsn,
-    Opcode.SET_ADDR_HI: SetAddrHiInsn,
-}
+
+_R_TYPE_CLASSES = _classes_for_format(InsnFormat.R_TYPE)
+_M_TYPE_CLASSES = _classes_for_format(InsnFormat.M_TYPE)
+_A_TYPE_CLASSES = _classes_for_format(InsnFormat.A_TYPE)
 
 
 def encode(insn: Instruction) -> bytes:

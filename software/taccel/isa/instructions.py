@@ -1,8 +1,15 @@
-"""Instruction dataclasses for all ISA instruction types."""
+"""Instruction dataclasses for all ISA instruction types.
+
+Each concrete instruction class is annotated with @register_insn so that
+opcode/format/mnemonic/class live next to the dataclass that owns them.
+encoding.py and assembler/syntax.py derive their dispatch tables from
+opcodes.ISA_SPEC instead of maintaining parallel copies.
+"""
 from dataclasses import dataclass, field
 from typing import Optional
 from .opcodes import (
-    Opcode, BUFFER_MAX_OFF, BUF_ABUF, BUF_WBUF, BUF_ACCUM, BUF_RESERVED,
+    Opcode, InsnFormat, BUFFER_MAX_OFF, BUF_ABUF, BUF_WBUF, BUF_ACCUM, BUF_RESERVED,
+    register_insn, _rebuild_derived_tables,
 )
 
 
@@ -49,51 +56,61 @@ class RTypeInsn(Instruction):
             raise ValueError(f"flags must be 0 or 1, got {self.flags}")
 
 
+@register_insn(Opcode.MATMUL, InsnFormat.R_TYPE, "MATMUL")
 @dataclass
 class MatmulInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.MATMUL, init=False)
 
 
+@register_insn(Opcode.REQUANT, InsnFormat.R_TYPE, "REQUANT")
 @dataclass
 class RequantInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.REQUANT, init=False)
 
 
+@register_insn(Opcode.REQUANT_PC, InsnFormat.R_TYPE, "REQUANT_PC")
 @dataclass
 class RequantPcInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.REQUANT_PC, init=False)
 
 
+@register_insn(Opcode.SCALE_MUL, InsnFormat.R_TYPE, "SCALE_MUL")
 @dataclass
 class ScaleMulInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.SCALE_MUL, init=False)
 
 
+@register_insn(Opcode.VADD, InsnFormat.R_TYPE, "VADD")
 @dataclass
 class VaddInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.VADD, init=False)
 
 
+@register_insn(Opcode.SOFTMAX, InsnFormat.R_TYPE, "SOFTMAX")
 @dataclass
 class SoftmaxInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.SOFTMAX, init=False)
 
 
+@register_insn(Opcode.LAYERNORM, InsnFormat.R_TYPE, "LAYERNORM")
 @dataclass
 class LayernormInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.LAYERNORM, init=False)
 
 
+@register_insn(Opcode.GELU, InsnFormat.R_TYPE, "GELU")
 @dataclass
 class GeluInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.GELU, init=False)
 
 
+@register_insn(Opcode.SOFTMAX_ATTNV, InsnFormat.R_TYPE, "SOFTMAX_ATTNV")
 @dataclass
 class SoftmaxAttnVInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.SOFTMAX_ATTNV, init=False)
 
 
+@register_insn(Opcode.DEQUANT_ADD, InsnFormat.R_TYPE, "DEQUANT_ADD")
 @dataclass
 class DequantAddInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.DEQUANT_ADD, init=False)
@@ -125,17 +142,20 @@ class MTypeInsn(Instruction):
             raise ValueError(f"flags must be 0-7, got {self.flags}")
 
 
+@register_insn(Opcode.LOAD, InsnFormat.M_TYPE, "LOAD")
 @dataclass
 class LoadInsn(MTypeInsn):
     opcode: Opcode = field(default=Opcode.LOAD, init=False)
 
 
+@register_insn(Opcode.STORE, InsnFormat.M_TYPE, "STORE")
 @dataclass
 class StoreInsn(MTypeInsn):
     opcode: Opcode = field(default=Opcode.STORE, init=False)
 
 
 # --- B-type instruction ---
+@register_insn(Opcode.BUF_COPY, InsnFormat.B_TYPE, "BUF_COPY")
 @dataclass
 class BufCopyInsn(Instruction):
     opcode: Opcode = field(default=Opcode.BUF_COPY, init=False)
@@ -173,17 +193,20 @@ class ATypeInsn(Instruction):
             raise ValueError(f"imm28 must be 0-0xFFFFFFF, got {self.imm28}")
 
 
+@register_insn(Opcode.SET_ADDR_LO, InsnFormat.A_TYPE, "SET_ADDR_LO")
 @dataclass
 class SetAddrLoInsn(ATypeInsn):
     opcode: Opcode = field(default=Opcode.SET_ADDR_LO, init=False)
 
 
+@register_insn(Opcode.SET_ADDR_HI, InsnFormat.A_TYPE, "SET_ADDR_HI")
 @dataclass
 class SetAddrHiInsn(ATypeInsn):
     opcode: Opcode = field(default=Opcode.SET_ADDR_HI, init=False)
 
 
 # --- C-type instruction ---
+@register_insn(Opcode.CONFIG_TILE, InsnFormat.C_TYPE, "CONFIG_TILE")
 @dataclass
 class ConfigTileInsn(Instruction):
     opcode: Opcode = field(default=Opcode.CONFIG_TILE, init=False)
@@ -198,6 +221,7 @@ class ConfigTileInsn(Instruction):
 
 
 # --- S-type instructions ---
+@register_insn(Opcode.SET_SCALE, InsnFormat.S_TYPE, "SET_SCALE")
 @dataclass
 class SetScaleInsn(Instruction):
     opcode: Opcode = field(default=Opcode.SET_SCALE, init=False)
@@ -214,6 +238,7 @@ class SetScaleInsn(Instruction):
             raise ValueError(f"imm16 must be 0-0xFFFF, got {self.imm16}")
 
 
+@register_insn(Opcode.SYNC, InsnFormat.S_TYPE, "SYNC")
 @dataclass
 class SyncInsn(Instruction):
     opcode: Opcode = field(default=Opcode.SYNC, init=False)
@@ -224,11 +249,18 @@ class SyncInsn(Instruction):
             raise ValueError(f"resource_mask must be 0-7, got {self.resource_mask}")
 
 
+@register_insn(Opcode.NOP, InsnFormat.S_TYPE, "NOP")
 @dataclass
 class NopInsn(Instruction):
     opcode: Opcode = field(default=Opcode.NOP, init=False)
 
 
+@register_insn(Opcode.HALT, InsnFormat.S_TYPE, "HALT")
 @dataclass
 class HaltInsn(Instruction):
     opcode: Opcode = field(default=Opcode.HALT, init=False)
+
+
+# Finalize: build derived dispatch views (OPCODE_FORMAT) and verify all 20 opcodes
+# are registered. Runs once per module import.
+_rebuild_derived_tables()

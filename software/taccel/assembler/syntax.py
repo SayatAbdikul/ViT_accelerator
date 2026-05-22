@@ -1,7 +1,7 @@
 """Assembly syntax parser - converts text lines to instruction objects."""
 import re
 from typing import Optional, Tuple, List
-from ..isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
+from ..isa.opcodes import Opcode, InsnFormat, ISA_SPEC, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
     SoftmaxAttnVInsn, DequantAddInsn,
@@ -14,29 +14,8 @@ BUFFER_NAME_TO_ID = {"ABUF": BUF_ABUF, "WBUF": BUF_WBUF, "ACCUM": BUF_ACCUM}
 # Pattern: BUFNAME[0xOFFSET] or BUFNAME[OFFSET]
 BUF_REF_RE = re.compile(r'(ABUF|WBUF|ACCUM)\[(?:0x)?([0-9a-fA-F]+)\]')
 
-# Mnemonic aliases
-MNEMONIC_MAP = {
-    "NOP": Opcode.NOP,
-    "HALT": Opcode.HALT,
-    "SYNC": Opcode.SYNC,
-    "CONFIG_TILE": Opcode.CONFIG_TILE,
-    "SET_SCALE": Opcode.SET_SCALE,
-    "SET_ADDR_LO": Opcode.SET_ADDR_LO,
-    "SET_ADDR_HI": Opcode.SET_ADDR_HI,
-    "LOAD": Opcode.LOAD,
-    "STORE": Opcode.STORE,
-    "BUF_COPY": Opcode.BUF_COPY,
-    "MATMUL": Opcode.MATMUL,
-    "REQUANT": Opcode.REQUANT,
-    "REQUANT_PC": Opcode.REQUANT_PC,
-    "SCALE_MUL": Opcode.SCALE_MUL,
-    "VADD": Opcode.VADD,
-    "SOFTMAX": Opcode.SOFTMAX,
-    "LAYERNORM": Opcode.LAYERNORM,
-    "GELU": Opcode.GELU,
-    "SOFTMAX_ATTNV": Opcode.SOFTMAX_ATTNV,
-    "DEQUANT_ADD": Opcode.DEQUANT_ADD,
-}
+# Mnemonic → Opcode dispatch derived from ISA_SPEC (single source of truth in opcodes.py).
+MNEMONIC_MAP = {entry.mnemonic: op for op, entry in ISA_SPEC.items()}
 
 
 def parse_int(s: str) -> int:
@@ -203,14 +182,8 @@ def _parse_r_type(opcode: Opcode, args_str: str) -> Instruction:
     Format: MATMUL ABUF[0x100], WBUF[0x000], ACCUM[0x000], S0, acc=1
     Or key=value: src1=ABUF[0], src2=WBUF[0], dst=ACCUM[0], sreg=S0, flags=0
     """
-    cls_map = {
-        Opcode.MATMUL: MatmulInsn, Opcode.REQUANT: RequantInsn,
-        Opcode.REQUANT_PC: RequantPcInsn,
-        Opcode.SCALE_MUL: ScaleMulInsn, Opcode.VADD: VaddInsn,
-        Opcode.SOFTMAX: SoftmaxInsn, Opcode.LAYERNORM: LayernormInsn,
-        Opcode.GELU: GeluInsn, Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
-        Opcode.DEQUANT_ADD: DequantAddInsn,
-    }
+    # Derive R-type opcode→class from ISA_SPEC instead of duplicating the table.
+    cls_map = {op: e.insn_class for op, e in ISA_SPEC.items() if e.format == InsnFormat.R_TYPE}
 
     if '=' in args_str and 'src1=' in args_str:
         # Key-value format

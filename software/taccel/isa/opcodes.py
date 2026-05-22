@@ -20,7 +20,9 @@ Reserved fields / opcodes
 - M-TYPE stride_log2 [6:3] is reserved and must be zero.
 - M-TYPE flags [2:0] are reserved and must be zero.
 """
+from dataclasses import dataclass
 from enum import IntEnum
+from typing import Callable, Dict
 
 
 class Opcode(IntEnum):
@@ -55,28 +57,61 @@ class InsnFormat(IntEnum):
     S_TYPE = 5
 
 
-OPCODE_FORMAT = {
-    Opcode.NOP: InsnFormat.S_TYPE,
-    Opcode.HALT: InsnFormat.S_TYPE,
-    Opcode.SYNC: InsnFormat.S_TYPE,
-    Opcode.CONFIG_TILE: InsnFormat.C_TYPE,
-    Opcode.SET_SCALE: InsnFormat.S_TYPE,
-    Opcode.SET_ADDR_LO: InsnFormat.A_TYPE,
-    Opcode.SET_ADDR_HI: InsnFormat.A_TYPE,
-    Opcode.LOAD: InsnFormat.M_TYPE,
-    Opcode.STORE: InsnFormat.M_TYPE,
-    Opcode.BUF_COPY: InsnFormat.B_TYPE,
-    Opcode.MATMUL: InsnFormat.R_TYPE,
-    Opcode.REQUANT: InsnFormat.R_TYPE,
-    Opcode.SCALE_MUL: InsnFormat.R_TYPE,
-    Opcode.VADD: InsnFormat.R_TYPE,
-    Opcode.SOFTMAX: InsnFormat.R_TYPE,
-    Opcode.LAYERNORM: InsnFormat.R_TYPE,
-    Opcode.GELU: InsnFormat.R_TYPE,
-    Opcode.REQUANT_PC: InsnFormat.R_TYPE,
-    Opcode.SOFTMAX_ATTNV: InsnFormat.R_TYPE,
-    Opcode.DEQUANT_ADD: InsnFormat.R_TYPE,
-}
+# ─── Single source of truth for the (opcode, format, mnemonic, class) tuple ───
+# Populated by @register_insn decorators in instructions.py; consumed by encoding.py
+# and assembler/syntax.py to derive their dispatch tables. Adding a new instruction
+# touches exactly one place (the new @register_insn line) instead of four.
+
+@dataclass(frozen=True)
+class IsaEntry:
+    opcode: "Opcode"
+    format: "InsnFormat"
+    mnemonic: str
+    insn_class: type
+
+
+ISA_SPEC: Dict["Opcode", IsaEntry] = {}
+
+
+def register_insn(opcode: "Opcode", fmt: "InsnFormat", mnemonic: str) -> Callable[[type], type]:
+    """Decorator that registers an instruction dataclass in ISA_SPEC.
+
+    Usage in instructions.py:
+        @register_insn(Opcode.NOP, InsnFormat.S_TYPE, "NOP")
+        @dataclass
+        class NopInsn(Instruction): ...
+
+    Decorator order matters: @dataclass runs first (inner), then @register_insn
+    (outer) stores the constructed class.
+    """
+    def wrapper(cls: type) -> type:
+        if opcode in ISA_SPEC:
+            raise RuntimeError(
+                f"Duplicate ISA_SPEC registration for {opcode!r}: "
+                f"existing={ISA_SPEC[opcode].insn_class.__name__}, new={cls.__name__}"
+            )
+        ISA_SPEC[opcode] = IsaEntry(opcode=opcode, format=fmt, mnemonic=mnemonic, insn_class=cls)
+        return cls
+    return wrapper
+
+
+# Backward-compatible derived view. Populated after instructions.py is imported
+# (at which point every @register_insn has run). Consumers that import OPCODE_FORMAT
+# transitively import instructions, so this dict is full by the time they read it.
+OPCODE_FORMAT: Dict["Opcode", "InsnFormat"] = {}
+
+
+def _rebuild_derived_tables() -> None:
+    """Refresh derived public exports from ISA_SPEC. Called by instructions.py
+    after all @register_insn decorators have run."""
+    OPCODE_FORMAT.clear()
+    for op, entry in ISA_SPEC.items():
+        OPCODE_FORMAT[op] = entry.format
+    missing = set(Opcode) - set(ISA_SPEC.keys())
+    if missing:
+        raise RuntimeError(
+            f"ISA_SPEC missing entries for opcodes: {sorted(m.name for m in missing)}"
+        )
 
 # Buffer IDs (2-bit, shared across R-type, M-type, B-type)
 BUF_ABUF = 0b00      # Activation buffer (128 KB, INT8)
