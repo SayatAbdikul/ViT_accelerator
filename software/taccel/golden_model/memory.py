@@ -126,6 +126,53 @@ def write_int32_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
         buf[byte_offset:end] = flat
 
 
+def read_fp32_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) -> np.ndarray:
+    """Read an FP32 tile from a buffer (W8A32 path).
+
+    For ACCUM: view the underlying int32 storage as float32 (same byte layout).
+    For ABUF/WBUF: reinterpret bytes as float32. 4 bytes per element, so the
+    capacity in *elements* is one quarter of the byte capacity.
+    """
+    _check_sram_bounds(buf_id, offset_units)
+    byte_offset = offset_units * UNIT
+
+    if buf_id == BUF_ACCUM:
+        fp32_offset = byte_offset // 4
+        total = rows * cols
+        end = fp32_offset + total
+        if end > len(state.accum):
+            raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+        return state.accum.view(np.float32)[fp32_offset:end].reshape(rows, cols).copy()
+    else:
+        buf = state.get_buffer(buf_id)
+        total_bytes = rows * cols * 4
+        end = byte_offset + total_bytes
+        if end > len(buf):
+            raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+        return np.frombuffer(buf[byte_offset:end], dtype=np.float32).copy().reshape(rows, cols)
+
+
+def write_fp32_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
+    """Write an FP32 tile to a buffer (W8A32 path)."""
+    _check_sram_bounds(buf_id, offset_units)
+    byte_offset = offset_units * UNIT
+
+    if buf_id == BUF_ACCUM:
+        fp32_offset = byte_offset // 4
+        flat = data.astype(np.float32).flatten()
+        end = fp32_offset + len(flat)
+        if end > len(state.accum):
+            raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+        state.accum.view(np.float32)[fp32_offset:end] = flat
+    else:
+        buf = state.get_buffer(buf_id)
+        flat = data.astype(np.float32).tobytes()
+        end = byte_offset + len(flat)
+        if end > len(buf):
+            raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+        buf[byte_offset:end] = flat
+
+
 def read_bytes(state, buf_id: int, offset_units: int, length_bytes: int) -> bytes:
     """Read raw bytes from SRAM buffer."""
     _check_sram_bounds(buf_id, offset_units)
