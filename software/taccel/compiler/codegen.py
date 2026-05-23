@@ -11,22 +11,22 @@ from ..isa.instructions import (
     LoadInsn, StoreInsn, BufCopyInsn,
     ConfigTileInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
+from ..model_config import ModelConfig
 from .ir import IRNode, IRGraph
 from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
-from .graph_extract import NUM_PATCHES, EMBED_DIM
 from .sreg_allocator import SRegAllocator
 from .scale_emitter import fp16_to_uint16, emit_scale, emit_scale_pair
 from .dma_emitter import set_addr
 
 UNIT = 16
 
-# DeiT-tiny sequence length is 197 tokens; we pad to 208 = 13 × 16 so M aligns
-# to the systolic tile size. The 11 trailing rows are zero in the input but
-# LN(zero_row) = beta (non-zero), which would leak through QKV projections.
-# We zero K/V rows 197–207 explicitly via DMA from this constant block to
-# eliminate the beta-derived attention contribution from padding tokens.
-PAD_ROWS = 208 - 197  # = 11
+# Padding logic: ViT sequence length (num_patches + 1 CLS) is rounded up to a
+# multiple of the systolic tile size (16). The trailing rows are zero in the
+# input but LN(zero_row) = beta (non-zero), which would leak through QKV
+# projections. We zero K/V padding rows explicitly via DMA from a constant
+# block to eliminate the beta-derived attention contribution from padding
+# tokens. The constant ``cfg.pad_rows`` controls how many such rows exist.
 
 
 class CodeGenerator:
@@ -41,13 +41,16 @@ class CodeGenerator:
                  fused_softmax_attnv_blocks: Optional[set] = None,
                  fused_softmax_attnv_accum_out_proj_blocks: Optional[set] = None,
                  requant_pc_weight_names: Optional[set] = None,
-                 requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None):
+                 requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None,
+                 cfg: Optional[ModelConfig] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
             calibration_scales: tensor_name → per-tensor activation scale
             prescaled_biases: name → INT32 pre-scaled bias array
+            cfg: model dimensions (defaults to DeiT-tiny).
         """
+        self.cfg = cfg if cfg is not None else ModelConfig.deit_tiny()
         self.weight_data = weight_data
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
@@ -109,7 +112,7 @@ class CodeGenerator:
                     if alloc is not None:
                         self.mem.abuf.free(inp_name)
                     # Also free per-head sub-allocations (e.g. k_head0, q_head1)
-                    for h in range(3):
+                    for h in range(self.cfg.num_heads):
                         self.mem.abuf.free(f"{inp_name}_head{h}")
 
         self.instructions.append(HaltInsn())
@@ -144,17 +147,18 @@ class CodeGenerator:
             self.dram_blob.extend(blob)
             offset += len(blob)
 
-        # Zero-pad blob: PAD_ROWS rows × 64 bytes (= head_dim, which equals K_pad),
-        # used to mask attention padding rows in K and V before QKT. See PAD_ROWS
-        # docstring at the top of this module for why this is needed.
-        _zero_pad_size = PAD_ROWS * 64
+        # Zero-pad blob: pad_rows × head_dim bytes (head_dim equals K_pad after
+        # the QKV projections), used to mask attention padding rows in K and V
+        # before QKT. See the module-level padding-logic comment for context.
+        _zero_pad_size = self.cfg.pad_rows * self.cfg.head_dim
         self.dram_layout["__zero_pad__"] = offset
         self.dram_blob.extend(bytes(_zero_pad_size))
         offset += _zero_pad_size
 
-        # Input patches placeholder: the host writes 196 × 192 INT8 patch embeddings
-        # here before starting the program.  The program DMAs this region to ABUF.
-        _input_patches_size = NUM_PATCHES * EMBED_DIM  # 196 × 192 = 37,632 bytes
+        # Input patches placeholder: the host writes num_patches × embed_dim
+        # INT8 patch embeddings here before starting the program. The program
+        # DMAs this region to ABUF.
+        _input_patches_size = self.cfg.num_patches * self.cfg.embed_dim
         self.dram_layout["__input_patches__"] = offset
         self.dram_blob.extend(bytes(_input_patches_size))
         offset += _input_patches_size
@@ -1793,21 +1797,24 @@ class CodeGenerator:
             self.mem.abuf.allocations[node.name] = alloc
 
     def _emit_cls_prepend(self, node: IRNode):
-        """Emit CLS token prepend: load CLS to ABUF[0], then DMA patches to rows 1-196."""
+        """Emit CLS token prepend: load CLS to ABUF[0], then DMA patches into the rest."""
         cls_name = node.inputs[1]
         cls_dram = self._dram_offset_required(cls_name, "loading cls token")
-        # Load CLS token [1, 192] = 192 bytes = 12 × 16-byte units to ABUF row 0
-        self._emit_dma_load(BUF_ABUF, 0, 192, 0, cls_dram)
+        embed_dim = self.cfg.embed_dim
+        # Load CLS token [1, embed_dim] = embed_dim bytes to ABUF row 0
+        self._emit_dma_load(BUF_ABUF, 0, embed_dim, 0, cls_dram)
         self._emit(SyncInsn(resource_mask=0b001))
-        # DMA input patches from DRAM to ABUF rows 1-196.
-        # Host writes INT8 patch embeddings [196, 192] to DRAM[input_offset] before run.
-        # Row 1 starts at byte offset 192 = 12 × 16-byte units in ABUF.
+        # DMA input patches from DRAM to ABUF rows 1..num_patches.
+        # Host writes INT8 patch embeddings [num_patches, embed_dim] to
+        # DRAM[input_offset] before run. Row 1 starts at byte offset embed_dim
+        # = embed_dim // UNIT 16-byte units in ABUF.
         patches_dram = self.dram_layout["__input_patches__"]
-        patches_bytes = NUM_PATCHES * EMBED_DIM  # 196 × 192 = 37,632 bytes
-        self._emit_dma_load(BUF_ABUF, EMBED_DIM // UNIT, patches_bytes, 1, patches_dram)
+        patches_bytes = self.cfg.num_patches * embed_dim
+        self._emit_dma_load(BUF_ABUF, embed_dim // UNIT, patches_bytes, 1, patches_dram)
         self._emit(SyncInsn(resource_mask=0b001))
-        # Mark allocation for the full [208, 192] padded sequence (rows 197-207 stay zero)
-        self.mem.abuf.alloc(node.name, pad_dim(197) * 192, evictable=False)
+        # Mark allocation for the full [seq_len_pad, embed_dim] padded sequence
+        # (padding rows past seq_len stay zero).
+        self.mem.abuf.alloc(node.name, self.cfg.seq_len_pad * embed_dim, evictable=False)
 
     def _emit_pos_embed_add(self, node: IRNode):
         """Emit position embedding add."""
