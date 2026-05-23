@@ -108,6 +108,40 @@ Useful entry points:
 - `software/tools/batch_compare_rtl_golden.py`: run one or more images through
   the RTL-vs-golden compare flow.
 
+## Precision Modes
+
+The software toolchain supports two precision modes, selectable via
+`--mode` on the user-facing tools (`compile_model.py`, `run_golden.py`,
+`benchmark_fp32_vs_int8.py`, `batch_compare_rtl_golden.py`,
+`profile_memory.py`):
+
+| Mode | Weights | Activations | Accumulators | RTL parity |
+|---|---|---|---|---|
+| `w8a8` (default) | INT8 per-channel | INT8 per-tensor | INT32 | Yes — bit-exact |
+| `w8a32` | INT8 per-channel → FP32 dequant in DRAM | FP32 | FP32 (reinterpret ACCUM) | **Suspended** |
+
+W8A8 is the production path: it matches the RTL exactly and is what
+`batch_compare_rtl_golden.py` signs off against. W8A32 is a
+software-only path used to measure the accuracy ceiling of
+weight-quantization-only inference end-to-end through the real compiler
++ golden simulator. It bypasses every activation-side calibration knob
+and emits no `REQUANT*` / `DEQUANT_ADD` opcodes. The 5 INT8-hardwired
+RTL module groups (`systolic_array`, `systolic_pe`,
+`systolic_controller`, `blocking_helper_engine`, `sfu_engine`) would
+compute garbage on FP32 bit patterns, so RTL parity is explicitly
+disabled in `w8a32` mode; running `batch_compare_rtl_golden.py
+--mode w8a32` errors out with a pointer to `docs/precision_modes.md`.
+
+For the W8A32 end-to-end accuracy benchmark:
+
+```bash
+./.venv/bin/python3 software/tools/benchmark_w8a32.py --max-images 20
+```
+
+See `docs/precision_modes.md` for the motivation behind the W8A32 fork,
+the load-bearing accuracy gate (cos vs FP32 ≥ 0.998, cos vs fake_quant
+≥ 0.999), and the path forward (mixed precision / W4A8 / etc.).
+
 ## RTL Stack
 
 Important RTL files:
