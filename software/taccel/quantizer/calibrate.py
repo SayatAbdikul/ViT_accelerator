@@ -1,7 +1,8 @@
 """Calibration: collect activation ranges from FP32 model.
 
-Activation-quant-only — dormant on the W8A32 path (FP32 activations need no
-calibration). Retained for the W8A8 production pipeline.
+Activation-quant-only — dormant on the W8A32 and W8A16 paths (FP32 and
+FP16 activations need no calibration). Retained for the W8A8 production
+pipeline.
 """
 import numpy as np
 from dataclasses import dataclass, field

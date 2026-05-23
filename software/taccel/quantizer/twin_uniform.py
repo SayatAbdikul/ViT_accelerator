@@ -5,9 +5,9 @@ post-softmax and post-GELU tensors discussed in PTQ4ViT. They do not change the
 accelerator ISA or the stored tensor format; they are intended for search,
 replay, and fake-quant experiments.
 
-Activation-quant-only — dormant on the W8A32 path (post-softmax and post-GELU
-tensors stay FP32 end-to-end there). Retained for the W8A8 production
-pipeline.
+Activation-quant-only — dormant on the W8A32 and W8A16 paths (post-softmax
+and post-GELU tensors stay FP32 or FP16 end-to-end there). Retained for
+the W8A8 production pipeline.
 """
 
 from __future__ import annotations

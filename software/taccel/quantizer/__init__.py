@@ -28,3 +28,11 @@ from .hessian_guided import (
 # code should call ``W8A32_QUANTIZE(tensor)`` rather than retyping the
 # ``per_channel=True`` kwarg at each call site.
 W8A32_QUANTIZE = partial(quantize_tensor, per_channel=True)
+
+# W8A16 uses the identical per-channel INT8 weight quantization scheme — the
+# activation precision (FP32 vs FP16) does not affect the weight-side
+# contract. Aliased separately so the W8A16 codegen / tooling can import its
+# mode-named entry point and so future divergence (e.g. clip-search-driven
+# per-channel scales tuned for FP16-narrowed dequant weights) has a clean
+# place to land.
+W8A16_QUANTIZE = W8A32_QUANTIZE

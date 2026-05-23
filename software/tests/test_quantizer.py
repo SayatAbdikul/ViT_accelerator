@@ -517,3 +517,65 @@ class TestW8A32QuantizeEntryPoint:
                 f"apply_weight_quantization — the bit-equivalence contract "
                 f"that the plan's accuracy ceiling depends on is broken."
             )
+
+
+class TestW8A16QuantizeEntryPoint:
+    """W8A16 uses the same per-channel INT8 weight scheme as W8A32.
+
+    ``W8A16_QUANTIZE`` is an alias for ``W8A32_QUANTIZE`` — exported under
+    its mode-named identity so the parallel-modules pattern stays clean
+    and so any future W8A16-specific weight-quant policy (e.g. clip-search
+    tuned for FP16-narrowed dequant) has an obvious place to land.
+    """
+
+    def test_w8a16_quantize_is_exported_and_aliases_w8a32(self):
+        from taccel.quantizer import W8A16_QUANTIZE, W8A32_QUANTIZE
+        assert callable(W8A16_QUANTIZE)
+        assert W8A16_QUANTIZE is W8A32_QUANTIZE
+
+    def test_w8a16_quantize_matches_fake_quant_then_fp16_narrow(self):
+        """W8A16_QUANTIZE → dequantize → narrow to FP16 must match what
+        ``compile_w8a16`` stores in DRAM, which is exactly what the W8A16
+        accuracy ceiling depends on."""
+        from taccel.quantizer import W8A16_QUANTIZE
+        from taccel.quantizer.fake_quant import apply_weight_quantization
+
+        torch.manual_seed(11)
+
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(48, 64)
+                self.conv = nn.Conv2d(3, 8, kernel_size=4, stride=2)
+
+            def forward(self, x):
+                return self.fc(x)
+
+        model = Tiny()
+        fq_model, count = apply_weight_quantization(model)
+        assert count == 2
+
+        for (name_orig, m_orig), (name_fq, m_fq) in zip(
+            model.named_modules(), fq_model.named_modules()
+        ):
+            assert name_orig == name_fq
+            if not isinstance(m_orig, (nn.Linear, nn.Conv2d)):
+                continue
+            w = m_orig.weight.detach().cpu().numpy().astype(np.float32)
+            orig_shape = w.shape
+            w2 = w.reshape(orig_shape[0], -1) if w.ndim > 2 else w
+            q, scales = W8A16_QUANTIZE(w2)
+            # FP32 dequant matches fake_quant exactly (bit-equivalence).
+            w_dq_fp32 = dequantize_tensor(q, scales).astype(np.float32).reshape(orig_shape)
+            w_fq = m_fq.weight.detach().cpu().numpy().astype(np.float32)
+            np.testing.assert_array_equal(w_dq_fp32, w_fq), (
+                f"{name_orig}: FP32-dequant bit-equivalence broken"
+            )
+            # FP16 narrow is the W8A16-specific final step. We only assert
+            # the narrow stays close (no overflow); precision loss is
+            # expected.
+            w_dq_fp16 = w_dq_fp32.astype(np.float16).astype(np.float32)
+            assert np.isfinite(w_dq_fp16).all()
+            assert np.max(np.abs(w_dq_fp16 - w_fq)) < 1e-2, (
+                f"{name_orig}: FP16 narrow exceeded reasonable rounding bound"
+            )

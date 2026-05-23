@@ -1,8 +1,8 @@
 """SmoothQuant preprocessing for LayerNorm -> Linear pairs.
 
-Activation-quant-only — dormant on the W8A32 path (per-channel activation
-outliers do not need to be smoothed when activations stay in FP32). Retained
-for the W8A8 production pipeline.
+Activation-quant-only — dormant on the W8A32 and W8A16 paths (per-channel
+activation outliers do not need to be smoothed when activations stay in
+FP32 or FP16). Retained for the W8A8 production pipeline.
 """
 from __future__ import annotations
 
