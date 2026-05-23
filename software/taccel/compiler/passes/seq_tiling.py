@@ -62,11 +62,12 @@ the other; block ``i+1`` swaps.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..ir import IRGraph, IRNode
 from ...model_config import ModelConfig
-from .memory_estimate import decide_seq_tiling
+from .memory_estimate import decide_seq_tiling, TilingDecision
+from .memory_estimate_w8a32 import decide_seq_tiling_w8a32
 
 
 # ── DRAM staging region names. Codegen lazily allocates them on first
@@ -99,7 +100,7 @@ def seq_tiling_pass(graph: IRGraph, cfg: ModelConfig, ctx: Dict[str, Any]) -> IR
     and any model whose ``[seq_len_pad, embed_dim]`` activation exceeds
     ``ABUF_SIZE/3`` gets the rewrite described in the module docstring.
     """
-    decision = decide_seq_tiling(cfg)
+    decision = ctx.get("seq_tiling_decision") or decide_seq_tiling(cfg)
     ctx["seq_tiling_decision"] = decision
     if not decision.needs_tiling:
         return graph
@@ -453,4 +454,17 @@ def seq_tiling_pass(graph: IRGraph, cfg: ModelConfig, ctx: Dict[str, Any]) -> IR
     return new
 
 
-__all__ = ["seq_tiling_pass"]
+def seq_tiling_pass_w8a32(graph: IRGraph, cfg: ModelConfig, ctx: Dict[str, Any]) -> IRGraph:
+    """Sequence-tiling pass tuned for the W8A32 path.
+
+    Same IR rewrite as :func:`seq_tiling_pass`, but the policy comes from
+    :func:`decide_seq_tiling_w8a32` (4× per-element bytes). Tiling is
+    triggered for both DeiT-tiny and ViT-B in W8A32 mode because an FP32
+    residual exceeds the 128 KB ABUF on both.
+    """
+    decision = decide_seq_tiling_w8a32(cfg)
+    ctx["seq_tiling_decision"] = decision
+    return seq_tiling_pass(graph, cfg, ctx)
+
+
+__all__ = ["seq_tiling_pass", "seq_tiling_pass_w8a32"]

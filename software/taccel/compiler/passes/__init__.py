@@ -24,7 +24,7 @@ from typing import Callable, Dict, List, Optional, Any
 from ..ir import IRGraph
 from ...model_config import ModelConfig
 
-from .seq_tiling import seq_tiling_pass  # re-export
+from .seq_tiling import seq_tiling_pass, seq_tiling_pass_w8a32  # re-export
 
 
 PassFn = Callable[[IRGraph, ModelConfig, Dict[str, Any]], IRGraph]
@@ -38,6 +38,16 @@ def default_pipeline() -> List[PassFn]:
     it returns the graph unchanged.
     """
     return [seq_tiling_pass]
+
+
+def default_pipeline_w8a32() -> List[PassFn]:
+    """Pass pipeline for the W8A32 path.
+
+    Uses the FP32-aware sequence-tiling policy (4× per-element bytes), which
+    triggers tiling for both DeiT-tiny and ViT-B since a full FP32 residual
+    exceeds the 128 KB ABUF in either case.
+    """
+    return [seq_tiling_pass_w8a32]
 
 
 def run_passes(
