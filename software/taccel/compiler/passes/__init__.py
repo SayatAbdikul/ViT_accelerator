@@ -24,7 +24,11 @@ from typing import Callable, Dict, List, Optional, Any
 from ..ir import IRGraph
 from ...model_config import ModelConfig
 
-from .seq_tiling import seq_tiling_pass, seq_tiling_pass_w8a32  # re-export
+from .seq_tiling import (
+    seq_tiling_pass,
+    seq_tiling_pass_w8a32,
+    seq_tiling_pass_w8a16,
+)  # re-export
 
 
 PassFn = Callable[[IRGraph, ModelConfig, Dict[str, Any]], IRGraph]
@@ -48,6 +52,16 @@ def default_pipeline_w8a32() -> List[PassFn]:
     exceeds the 128 KB ABUF in either case.
     """
     return [seq_tiling_pass_w8a32]
+
+
+def default_pipeline_w8a16() -> List[PassFn]:
+    """Pass pipeline for the W8A16 path.
+
+    Uses the FP16-aware sequence-tiling policy (2× per-element bytes). The
+    FP16 residual fits in ABUF on DeiT-tiny, but the FC1 per-tile cap still
+    forces tiling — landing on the same tile_rows shape as the W8A32 path.
+    """
+    return [seq_tiling_pass_w8a16]
 
 
 def run_passes(

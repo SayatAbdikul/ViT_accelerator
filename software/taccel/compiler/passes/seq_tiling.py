@@ -68,6 +68,7 @@ from ..ir import IRGraph, IRNode
 from ...model_config import ModelConfig
 from .memory_estimate import decide_seq_tiling, TilingDecision
 from .memory_estimate_w8a32 import decide_seq_tiling_w8a32
+from .memory_estimate_w8a16 import decide_seq_tiling_w8a16
 
 
 # ── DRAM staging region names. Codegen lazily allocates them on first
@@ -467,4 +468,18 @@ def seq_tiling_pass_w8a32(graph: IRGraph, cfg: ModelConfig, ctx: Dict[str, Any])
     return seq_tiling_pass(graph, cfg, ctx)
 
 
-__all__ = ["seq_tiling_pass", "seq_tiling_pass_w8a32"]
+def seq_tiling_pass_w8a16(graph: IRGraph, cfg: ModelConfig, ctx: Dict[str, Any]) -> IRGraph:
+    """Sequence-tiling pass tuned for the W8A16 path.
+
+    Same IR rewrite as :func:`seq_tiling_pass`, but the policy comes from
+    :func:`decide_seq_tiling_w8a16` (2× per-element bytes). The FP16
+    residual fits in ABUF for DeiT-tiny on its own, but the FC1 cap still
+    forces a tile-rows=16 decision via the per-tile ABUF/2 bound — so the
+    rewritten IR is structurally identical to the W8A32 case.
+    """
+    decision = decide_seq_tiling_w8a16(cfg)
+    ctx["seq_tiling_decision"] = decision
+    return seq_tiling_pass(graph, cfg, ctx)
+
+
+__all__ = ["seq_tiling_pass", "seq_tiling_pass_w8a32", "seq_tiling_pass_w8a16"]
