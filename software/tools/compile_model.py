@@ -67,11 +67,12 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["w8a8", "w8a32"],
+        choices=["w8a8", "w8a32", "w8a16"],
         default="w8a8",
         help="Precision mode (see module docstring). w8a8 is the production / "
-             "RTL-matched path; w8a32 is software-only and bypasses activation "
-             "calibration entirely.",
+             "RTL-matched path; w8a32 and w8a16 are software-only and bypass "
+             "activation calibration entirely. w8a16 halves the dequant DRAM "
+             "footprint vs w8a32 with a small additional FP16 rounding noise.",
     )
     args = parser.parse_args()
 
@@ -92,6 +93,14 @@ def main():
         print(f"Compiling {args.model} in W8A32 mode...")
         compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a32")
         prog = compiler.compile_w8a32(state_dict)
+    elif args.mode == "w8a16":
+        if args.calibration_images:
+            print("[w8a16] ignoring --calibration-images (no activation quant in this mode)")
+        if args.gelu_from_accum or args.requant_pc_qkv or args.requant_pc_out_proj:
+            print("[w8a16] ignoring --gelu-from-accum / --requant-pc-* (no INT8 bridge to fuse across)")
+        print(f"Compiling {args.model} in W8A16 mode...")
+        compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a16")
+        prog = compiler.compile_w8a16(state_dict)
     else:
         calibration = None
         if args.calibration_images:

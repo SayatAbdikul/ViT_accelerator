@@ -374,11 +374,12 @@ def parse_args() -> argparse.Namespace:
                    help="Keep per-image working directories after run")
     p.add_argument(
         "--mode",
-        choices=["w8a8", "w8a32"],
+        choices=["w8a8", "w8a32", "w8a16"],
         default="w8a8",
         help="Precision mode. Only w8a8 is supported here — RTL parity is "
-             "explicitly suspended in w8a32 (the 5 RTL module groups are "
-             "hardwired INT8 and would compute garbage on FP32 bit patterns).",
+             "explicitly suspended in w8a32 and w8a16 (the 5 RTL module "
+             "groups are hardwired INT8 and would compute garbage on FP32 / "
+             "FP16 bit patterns).",
     )
     return p.parse_args()
 
@@ -386,15 +387,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if args.mode == "w8a32":
+    if args.mode in ("w8a32", "w8a16"):
+        bench_tool = "benchmark_w8a32.py" if args.mode == "w8a32" else "benchmark_w8a16.py"
         raise SystemExit(
-            "RTL parity is suspended in W8A32 mode.\n"
+            f"RTL parity is suspended in {args.mode.upper()} mode.\n"
             "The 5 RTL module groups (systolic_array, systolic_pe, "
             "systolic_controller, blocking_helper_engine, sfu_engine) are\n"
-            "hardwired INT8 and would silently compute garbage on FP32 bit "
-            "patterns. See docs/precision_modes.md for context, and use the\n"
-            "dedicated W8A32 benchmark (software/tools/benchmark_w8a32.py) "
-            "for end-to-end W8A32 accuracy measurement instead."
+            "hardwired INT8 and would silently compute garbage on FP32 / FP16 "
+            "bit patterns. See docs/precision_modes.md for context, and use\n"
+            f"the dedicated benchmark (software/tools/{bench_tool}) for "
+            f"end-to-end {args.mode.upper()} accuracy measurement instead."
         )
 
     from tools import benchmark_fp32_vs_int8 as cg

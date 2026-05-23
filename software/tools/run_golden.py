@@ -101,7 +101,7 @@ def main():
     parser.add_argument("--top-k", type=int, default=5, help="Show top-K predictions")
     parser.add_argument(
         "--mode",
-        choices=["w8a8", "w8a32"],
+        choices=["w8a8", "w8a32", "w8a16"],
         default="w8a8",
         help="Precision mode (must match the program's compile mode).",
     )
@@ -119,6 +119,11 @@ def main():
         sim = SimulatorW8A32()
         sim.load_program(prog)
         state = sim.state
+    elif args.mode == "w8a16":
+        from taccel.golden_model.simulator_w8a16 import SimulatorW8A16
+        sim = SimulatorW8A16()
+        sim.load_program(prog)
+        state = sim.state
     else:
         from taccel.golden_model import Simulator, MachineState
         state = MachineState(dram_data=prog.data)
@@ -128,8 +133,7 @@ def main():
     # Load input if provided
     if args.input:
         if args.mode == "w8a32":
-            # FP32 patch embeddings (host-side Conv2d output). Accept .npy
-            # or raw .bin (interpreted as FP32 little-endian).
+            # FP32 patch embeddings (host-side Conv2d output).
             if args.input.endswith('.npy'):
                 inp_fp32 = np.load(args.input).astype(np.float32)
             else:
@@ -139,6 +143,17 @@ def main():
             inp_bytes = inp_fp32.tobytes()
             state.dram[prog.input_offset:prog.input_offset + len(inp_bytes)] = inp_bytes
             print(f"Loaded FP32 input: {inp_fp32.shape}")
+        elif args.mode == "w8a16":
+            # FP16 patch embeddings (host-side Conv2d output, narrowed to FP16).
+            if args.input.endswith('.npy'):
+                inp_fp16 = np.load(args.input).astype(np.float16)
+            else:
+                inp_fp16 = np.frombuffer(
+                    open(args.input, 'rb').read(), dtype=np.float16
+                )
+            inp_bytes = inp_fp16.tobytes()
+            state.dram[prog.input_offset:prog.input_offset + len(inp_bytes)] = inp_bytes
+            print(f"Loaded FP16 input: {inp_fp16.shape}")
         else:
             inp = load_input_array(args.input)
             cls_inp = load_input_array(args.cls_input) if args.cls_input else None
@@ -154,7 +169,7 @@ def main():
                 print(f"Loaded CLS input: {cls_inp.shape}")
 
     print("Running simulation...")
-    if args.mode == "w8a32":
+    if args.mode in ("w8a32", "w8a16"):
         count = sim.run(max_instructions=prog.insn_count + 10)
     else:
         count = sim.run()
@@ -166,6 +181,12 @@ def main():
             state.abuf, dtype=np.float32,
             count=co["N_pad"], offset=co["offset_bytes"],
         )[:co["logical_cols"]].copy()
+    elif args.mode == "w8a16":
+        co = prog.compiler_manifest["classifier_output"]
+        logits_fp32 = np.frombuffer(
+            state.abuf, dtype=np.float16,
+            count=co["N_pad"], offset=co["offset_bytes"],
+        )[:co["logical_cols"]].astype(np.float32)
     else:
         # The compiler places classifier output at ACCUM[0] as INT32.
         logits_int32 = state.accum[:1000].copy()

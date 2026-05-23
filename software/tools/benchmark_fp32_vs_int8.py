@@ -4887,19 +4887,23 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["w8a8", "w8a32"],
+        choices=["w8a8", "w8a32", "w8a16"],
         default="w8a8",
         help="Precision mode. w8a8 (default) runs the full INT8 toolchain. "
-             "w8a32 delegates to tools/benchmark_w8a32.py — FP32 activations "
-             "with INT8 weights, compared directly against the HF FP32 "
-             "reference; activation-calibration flags are ignored.",
+             "w8a32 / w8a16 delegate to tools/benchmark_w8a32.py / "
+             "tools/benchmark_w8a16.py respectively — FP activations with "
+             "INT8 weights, compared directly against the HF FP32 reference; "
+             "activation-calibration flags are ignored.",
     )
     args = parser.parse_args()
 
-    if args.mode == "w8a32":
-        from tools import benchmark_w8a32 as _bw
-        # Hand off only the args benchmark_w8a32 understands. Everything else
-        # is W8A8-specific calibration plumbing that has no meaning in W8A32.
+    if args.mode in ("w8a32", "w8a16"):
+        if args.mode == "w8a32":
+            from tools import benchmark_w8a32 as _bw
+        else:
+            from tools import benchmark_w8a16 as _bw
+        # Hand off only the args the W8A32/W8A16 benchmarks understand —
+        # the rest is W8A8 calibration plumbing with no meaning here.
         sys.argv = [
             sys.argv[0],
             "--max-images", str(args.max_images),
