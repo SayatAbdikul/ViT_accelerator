@@ -372,11 +372,30 @@ def parse_args() -> argparse.Namespace:
                    help="Root working directory (default: auto tempdir)")
     p.add_argument("--keep-work",      action="store_true",
                    help="Keep per-image working directories after run")
+    p.add_argument(
+        "--mode",
+        choices=["w8a8", "w8a32"],
+        default="w8a8",
+        help="Precision mode. Only w8a8 is supported here — RTL parity is "
+             "explicitly suspended in w8a32 (the 5 RTL module groups are "
+             "hardwired INT8 and would compute garbage on FP32 bit patterns).",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.mode == "w8a32":
+        raise SystemExit(
+            "RTL parity is suspended in W8A32 mode.\n"
+            "The 5 RTL module groups (systolic_array, systolic_pe, "
+            "systolic_controller, blocking_helper_engine, sfu_engine) are\n"
+            "hardwired INT8 and would silently compute garbage on FP32 bit "
+            "patterns. See docs/precision_modes.md for context, and use the\n"
+            "dedicated W8A32 benchmark (software/tools/benchmark_w8a32.py) "
+            "for end-to-end W8A32 accuracy measurement instead."
+        )
 
     from tools import benchmark_fp32_vs_int8 as cg
 

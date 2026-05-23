@@ -8,6 +8,12 @@ compile pipeline.
 Usage:
     python -m tools.profile_memory --model deit-tiny
     python -m tools.profile_memory --model vit-base
+    python -m tools.profile_memory --model vit-base --mode w8a32
+
+Modes:
+    w8a8  — INT8 activations (1 byte/element); default.
+    w8a32 — FP32 activations (4 bytes/element). ABUF capacity in *elements*
+            is 4× smaller and the M2 seq-tiling policy kicks in earlier.
 """
 from __future__ import annotations
 
@@ -21,6 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from taccel.isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE  # noqa: E402
 from taccel.model_config import ModelConfig  # noqa: E402
 from taccel.compiler.passes.memory_estimate import decide_seq_tiling  # noqa: E402
+from taccel.compiler.passes.memory_estimate_w8a32 import (  # noqa: E402
+    decide_seq_tiling_w8a32,
+)
 
 
 _MODELS = {
@@ -37,22 +46,25 @@ def _bytes_pretty(n: int) -> str:
     return f"{n} B"
 
 
-def estimate_peak_abuf(cfg: ModelConfig) -> dict:
-    """Estimate ABUF allocations in INT8 bytes for one transformer block.
+def estimate_peak_abuf(cfg: ModelConfig, element_bytes: int = 1) -> dict:
+    """Estimate ABUF allocations in bytes for one transformer block.
 
     The codegen aggressively frees per-head sub-allocations and the strip-mined
     MLP cleans up between strips, so the relevant question is *what is the
     largest single allocation we attempt?* — if that exceeds the buffer cap,
     no amount of clever ordering will help.
+
+    ``element_bytes`` defaults to 1 (W8A8 INT8 activations). Pass 4 for the
+    W8A32 path (FP32 activations) — every estimate scales linearly.
     """
     embed = cfg.embed_dim
     seq = cfg.seq_len_pad
     head_dim = cfg.head_dim
 
-    residual = seq * embed
-    qkv_one_head = 3 * seq * head_dim
-    attn_scratch = seq * seq  # softmax row buffer (INT8 attention probs)
-    mlp_strip = seq * 16  # codegen strip-mines MLP at 16 cols/strip
+    residual = seq * embed * element_bytes
+    qkv_one_head = 3 * seq * head_dim * element_bytes
+    attn_scratch = seq * seq * element_bytes  # softmax row buffer
+    mlp_strip = seq * 16 * element_bytes  # codegen strip-mines MLP at 16 cols/strip
 
     largest_single = max(residual, qkv_one_head, attn_scratch, mlp_strip)
     return {
@@ -81,13 +93,16 @@ def estimate_weight_dram(cfg: ModelConfig) -> int:
     return per_block * cfg.depth + embedding + head
 
 
-def report(cfg: ModelConfig, label: str) -> None:
-    print(f"=== {label} ===")
+def report(cfg: ModelConfig, label: str, mode: str = "w8a8") -> None:
+    element_bytes = 4 if mode == "w8a32" else 1
+    print(f"=== {label} ({mode}) ===")
     print(f"  embed_dim={cfg.embed_dim}  heads={cfg.num_heads}  head_dim={cfg.head_dim}")
     print(f"  depth={cfg.depth}  mlp_dim={cfg.mlp_dim}")
     print(f"  seq_len={cfg.seq_len}  seq_len_pad={cfg.seq_len_pad}")
+    print(f"  activation element width: {element_bytes} byte"
+          f"{'s' if element_bytes != 1 else ''}")
 
-    abuf = estimate_peak_abuf(cfg)
+    abuf = estimate_peak_abuf(cfg, element_bytes=element_bytes)
     print()
     print("  ABUF allocation sizes (single block):")
     for k in ["residual", "qkv_one_head", "attn_scratch", "mlp_strip"]:
@@ -97,7 +112,12 @@ def report(cfg: ModelConfig, label: str) -> None:
 
     wbuf_dram = estimate_weight_dram(cfg)
     print()
-    print(f"  Weight DRAM footprint (INT8): {_bytes_pretty(wbuf_dram)}")
+    if mode == "w8a32":
+        # FP32 weights live in DRAM (INT8 quantize → dequant at compile time),
+        # so the DRAM footprint is 4× the INT8 number.
+        print(f"  Weight DRAM footprint (FP32 dequant): {_bytes_pretty(wbuf_dram * 4)}")
+    else:
+        print(f"  Weight DRAM footprint (INT8): {_bytes_pretty(wbuf_dram)}")
     print(f"  WBUF capacity (streams from DRAM): {_bytes_pretty(WBUF_SIZE)}")
     print(f"  ACCUM capacity: {_bytes_pretty(ACCUM_SIZE)}")
 
@@ -105,15 +125,19 @@ def report(cfg: ModelConfig, label: str) -> None:
     fits = abuf["largest_single_alloc"] <= ABUF_SIZE
     print(f"  ABUF fit (untiled): {'YES' if fits else 'NO — sequence tiling required'}")
 
-    # Report M2 sequence-tiling policy.
-    decision = decide_seq_tiling(cfg)
+    # Report M2 sequence-tiling policy for the selected mode.
+    if mode == "w8a32":
+        decision = decide_seq_tiling_w8a32(cfg)
+    else:
+        decision = decide_seq_tiling(cfg)
     if decision.needs_tiling:
         per_tile = decision.per_tile_bytes
         print(f"  → M2 seq tiling: tile={decision.tile_rows} rows × "
               f"{decision.num_tiles} tiles, per-tile residual = "
               f"{_bytes_pretty(per_tile)}")
     else:
-        print(f"  → M2 seq tiling: not required ({decision.reason})")
+        reason = getattr(decision, "reason", "fits untiled")
+        print(f"  → M2 seq tiling: not required ({reason})")
 
     # Wide-weight WBUF check (M3 boundary).
     widest_weight = max(
@@ -135,11 +159,18 @@ def main() -> int:
         choices=sorted(_MODELS.keys()),
         help="Model preset to report on (may be repeated). Default: all.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["w8a8", "w8a32"],
+        default="w8a8",
+        help="Precision mode. w8a8 = INT8 activations (1 byte/element); "
+             "w8a32 = FP32 activations (4 bytes/element), 4× tighter ABUF.",
+    )
     args = parser.parse_args()
 
     models = args.model or sorted(_MODELS.keys())
     for name in models:
-        report(_MODELS[name](), name)
+        report(_MODELS[name](), name, mode=args.mode)
     return 0
 
 

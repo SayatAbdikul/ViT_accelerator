@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""CLI: simulate program.bin with input image"""
+"""CLI: simulate program.bin with input image.
+
+Supports two precision modes via ``--mode`` (must match the mode the
+program was compiled with):
+
+* ``w8a8`` (default) — reads INT8 patch embeddings, dispatches to
+  ``Simulator``, extracts INT32 ACCUM logits and casts to FP32.
+* ``w8a32`` — reads FP32 patch embeddings (host-side Conv2d output),
+  dispatches to ``SimulatorW8A32``, extracts FP32 logits from ABUF at
+  the offset recorded in ``compiler_manifest['classifier_output']``.
+"""
 import argparse
 import sys
 import os
@@ -89,6 +99,12 @@ def main():
     )
     parser.add_argument("--output", help="Output logits file (.npy)")
     parser.add_argument("--top-k", type=int, default=5, help="Show top-K predictions")
+    parser.add_argument(
+        "--mode",
+        choices=["w8a8", "w8a32"],
+        default="w8a8",
+        help="Precision mode (must match the program's compile mode).",
+    )
     args = parser.parse_args()
 
     print(f"Loading program {args.program}...")
@@ -98,34 +114,62 @@ def main():
     prog = ProgramBinary.from_bytes(raw)
     print(f"  {prog.insn_count} instructions, {len(prog.data):,} bytes data")
 
-    from taccel.golden_model import Simulator, MachineState
-    state = MachineState(dram_data=prog.data)
-    sim = Simulator(state)
-    sim.load_program(prog)
+    if args.mode == "w8a32":
+        from taccel.golden_model.simulator_w8a32 import SimulatorW8A32
+        sim = SimulatorW8A32()
+        sim.load_program(prog)
+        state = sim.state
+    else:
+        from taccel.golden_model import Simulator, MachineState
+        state = MachineState(dram_data=prog.data)
+        sim = Simulator(state)
+        sim.load_program(prog)
 
     # Load input if provided
     if args.input:
-        inp = load_input_array(args.input)
-        cls_inp = load_input_array(args.cls_input) if args.cls_input else None
-        write_runtime_inputs(
-            state,
-            prog,
-            inp,
-            cls_input=cls_inp,
-            folded_pos_embed=args.folded_pos_embed,
-        )
-        print(f"Loaded input: {inp.shape}")
-        if cls_inp is not None:
-            print(f"Loaded CLS input: {cls_inp.shape}")
+        if args.mode == "w8a32":
+            # FP32 patch embeddings (host-side Conv2d output). Accept .npy
+            # or raw .bin (interpreted as FP32 little-endian).
+            if args.input.endswith('.npy'):
+                inp_fp32 = np.load(args.input).astype(np.float32)
+            else:
+                inp_fp32 = np.frombuffer(
+                    open(args.input, 'rb').read(), dtype=np.float32
+                )
+            inp_bytes = inp_fp32.tobytes()
+            state.dram[prog.input_offset:prog.input_offset + len(inp_bytes)] = inp_bytes
+            print(f"Loaded FP32 input: {inp_fp32.shape}")
+        else:
+            inp = load_input_array(args.input)
+            cls_inp = load_input_array(args.cls_input) if args.cls_input else None
+            write_runtime_inputs(
+                state,
+                prog,
+                inp,
+                cls_input=cls_inp,
+                folded_pos_embed=args.folded_pos_embed,
+            )
+            print(f"Loaded input: {inp.shape}")
+            if cls_inp is not None:
+                print(f"Loaded CLS input: {cls_inp.shape}")
 
     print("Running simulation...")
-    count = sim.run()
+    if args.mode == "w8a32":
+        count = sim.run(max_instructions=prog.insn_count + 10)
+    else:
+        count = sim.run()
     print(f"  Executed {count} instructions, {state.cycle_count} cycles")
 
-    # Extract output from ABUF (classifier output at start of ABUF)
-    # The compiler places classifier output at ABUF[0] as INT32 in ACCUM
-    logits_int32 = state.accum[:1000].copy()
-    logits_fp32 = logits_int32.astype(np.float32)
+    if args.mode == "w8a32":
+        co = prog.compiler_manifest["classifier_output"]
+        logits_fp32 = np.frombuffer(
+            state.abuf, dtype=np.float32,
+            count=co["N_pad"], offset=co["offset_bytes"],
+        )[:co["logical_cols"]].copy()
+    else:
+        # The compiler places classifier output at ACCUM[0] as INT32.
+        logits_int32 = state.accum[:1000].copy()
+        logits_fp32 = logits_int32.astype(np.float32)
 
     if args.output:
         np.save(args.output, logits_fp32)

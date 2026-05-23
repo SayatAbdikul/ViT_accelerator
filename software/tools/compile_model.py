@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""CLI: pytorch_model.bin → program.bin"""
+"""CLI: pytorch_model.bin → program.bin.
+
+Supports two precision modes via ``--mode``:
+
+* ``w8a8`` (default) — INT8 weights, INT8 activations, the production /
+  RTL-matched path. Honors activation calibration and the experimental
+  GELU/REQUANT_PC flags.
+* ``w8a32`` — INT8 weights (per-channel) dequantized into FP32 DRAM,
+  FP32 activations, FP32 accumulators. Software-only — RTL parity is
+  suspended in this mode. Used to measure the weight-only accuracy
+  ceiling end-to-end through the real compiler + golden simulator.
+  Calibration and all REQUANT_PC / GELU-from-ACCUM flags are ignored
+  (they have no meaning when there is no INT8 bridge to fuse across).
+"""
 import argparse
 import sys
 import os
@@ -52,6 +65,14 @@ def main():
         action="store_true",
         help="Enable the experimental REQUANT_PC path for out_proj matmuls",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["w8a8", "w8a32"],
+        default="w8a8",
+        help="Precision mode (see module docstring). w8a8 is the production / "
+             "RTL-matched path; w8a32 is software-only and bypasses activation "
+             "calibration entirely.",
+    )
     args = parser.parse_args()
 
     print(f"Loading weights from {args.weights}...")
@@ -60,32 +81,42 @@ def main():
     if hasattr(state_dict, 'items') is False:
         state_dict = state_dict.state_dict()
 
-    calibration = None
-    if args.calibration_images:
-        print(f"Calibrating on {len(args.calibration_images)} image(s)...")
-        calibration = build_calibration(MODEL_NAME, state_dict, args.calibration_images)
-        print(f"  Collected {len(calibration.scales)} activation scales")
-
-    print(f"Compiling {args.model}...")
     from taccel.compiler import Compiler
-    compiler = Compiler()
-    prog = compiler.compile(
-        state_dict,
-        calibration=calibration,
-        gelu_from_accum=args.gelu_from_accum,
-        requant_pc_qkv=args.requant_pc_qkv,
-        requant_pc_out_proj=args.requant_pc_out_proj,
-    )
+    from taccel.model_config import ModelConfig
+
+    if args.mode == "w8a32":
+        if args.calibration_images:
+            print("[w8a32] ignoring --calibration-images (no activation quant in this mode)")
+        if args.gelu_from_accum or args.requant_pc_qkv or args.requant_pc_out_proj:
+            print("[w8a32] ignoring --gelu-from-accum / --requant-pc-* (no INT8 bridge to fuse across)")
+        print(f"Compiling {args.model} in W8A32 mode...")
+        compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a32")
+        prog = compiler.compile_w8a32(state_dict)
+    else:
+        calibration = None
+        if args.calibration_images:
+            print(f"Calibrating on {len(args.calibration_images)} image(s)...")
+            calibration = build_calibration(MODEL_NAME, state_dict, args.calibration_images)
+            print(f"  Collected {len(calibration.scales)} activation scales")
+
+        print(f"Compiling {args.model}...")
+        compiler = Compiler()
+        prog = compiler.compile(
+            state_dict,
+            calibration=calibration,
+            gelu_from_accum=args.gelu_from_accum,
+            requant_pc_qkv=args.requant_pc_qkv,
+            requant_pc_out_proj=args.requant_pc_out_proj,
+        )
 
     with open(args.output, 'wb') as f:
         f.write(prog.to_bytes())
 
     print(f"\nCompilation complete:")
+    print(f"  Mode: {args.mode}")
     print(f"  Instructions: {prog.insn_count}")
     print(f"  Instruction bytes: {len(prog.instructions):,}")
     print(f"  Data (weights): {len(prog.data):,} bytes")
-    if calibration is not None:
-        print(f"  Input offset: {prog.input_offset}")
     print(f"  Output: {args.output}")
 
 

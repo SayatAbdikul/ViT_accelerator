@@ -4885,7 +4885,28 @@ def main():
         default="9,10,11",
         help="Comma-separated block indices used by --replay-late-mlp",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["w8a8", "w8a32"],
+        default="w8a8",
+        help="Precision mode. w8a8 (default) runs the full INT8 toolchain. "
+             "w8a32 delegates to tools/benchmark_w8a32.py — FP32 activations "
+             "with INT8 weights, compared directly against the HF FP32 "
+             "reference; activation-calibration flags are ignored.",
+    )
     args = parser.parse_args()
+
+    if args.mode == "w8a32":
+        from tools import benchmark_w8a32 as _bw
+        # Hand off only the args benchmark_w8a32 understands. Everything else
+        # is W8A8-specific calibration plumbing that has no meaning in W8A32.
+        sys.argv = [
+            sys.argv[0],
+            "--max-images", str(args.max_images),
+            "--image-dir", args.local_benchmark_image_dir,
+        ]
+        sys.exit(_bw.main())
+
     explicit_overrides = explicit_cli_dest_overrides()
     preset = apply_diagnostic_preset(args, explicit_overrides=explicit_overrides)
 
