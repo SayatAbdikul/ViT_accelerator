@@ -1,13 +1,14 @@
 # Precision modes
 
-This document explains the two precision modes supported by the TACCEL
-software toolchain, why both exist, and which one to use for which job.
+This document explains the three precision modes supported by the TACCEL
+software toolchain, why each exists, and which one to use for which job.
 
 ## Summary
 
 | Mode | Weights | Activations | Accumulators | Compiler | Golden sim | RTL parity |
 |---|---|---|---|---|---|---|
 | **`w8a8`** (default) | INT8 per-channel | INT8 per-tensor | INT32 | `Compiler.compile()` | `Simulator` | Bit-exact |
+| **`w8a16`** | INT8 per-channel → FP16 dequant in DRAM | FP16 | FP32 (mixed-precision) | `Compiler(mode='w8a16').compile_w8a16()` | `SimulatorW8A16` | **Suspended** |
 | **`w8a32`** | INT8 per-channel → FP32 dequant in DRAM | FP32 | FP32 (reinterpret ACCUM) | `Compiler(mode='w8a32').compile_w8a32()` | `SimulatorW8A32` | **Suspended** |
 
 `w8a8` is the production path. The RTL is hard-wired INT8 across all 5
@@ -21,6 +22,15 @@ calibration knob and emits no `REQUANT*` / `DEQUANT_ADD` opcodes. It
 exists to answer one question: **what accuracy ceiling does
 weight-quantization-only inference reach, end-to-end through the real
 compiler + golden simulator?**
+
+`w8a16` is the middle path: same architectural contract as W8A32 (no
+activation calibration, no INT8 bridge), but activations and dequant
+weights live as FP16 instead of FP32. This halves the dequant-DRAM
+footprint (172 MB for ViT-B vs. 344 MB W8A32) and doubles the ABUF
+element capacity, while keeping SFU and matmul reductions in FP32.
+Empirically W8A16 lands on the same accuracy as W8A32 on DeiT-tiny
+(`cos_fp32 ≈ 0.9989`, `cos_fq ≈ 0.999997`), well above its load-bearing
+gates of 0.997 / 0.998.
 
 ## Why both exist — the bisection that motivated W8A32
 
@@ -156,33 +166,89 @@ indicates a regression (e.g. the seq-padding attention leak that the
 mask in `_emit_qkt` fixes). Reviewers must refuse threshold weakening
 without a written rationale.
 
+## W8A16: the FP16 middle path
+
+W8A16 follows the same software-only contract as W8A32 — no activation
+calibration, no INT8 bridge, no fused `REQUANT*` paths — but stores
+both activations and dequant weights as FP16 instead of FP32. The
+matmul accumulator and SFU internal reductions stay in FP32, matching
+the standard mixed-precision convention.
+
+Why this earns its own fork:
+
+- **DRAM footprint halves.** ViT-B FP16 dequant weights = 172 MB vs.
+  344 MB W8A32 vs. 86 MB W8A8 INT8 raw. Halfway back to the INT8
+  density while keeping the FP-native datapath.
+- **ABUF element capacity doubles.** 128 KB / 2 = 64 K FP16 elements
+  vs. 32 K FP32 elements; the W8A32 deferred-V load machinery is
+  unnecessary because per-head Q+K+V FP16 (~38 KB total) fits in
+  ABUF on its own.
+- **SFU internal math unchanged.** All reductions widen FP16 → FP32 on
+  read; the FP32 fp32_prim_ref primitives (exp, erf, gelu, sum, mean,
+  var) are reused verbatim.
+- **Attention mask is `-65504.0`** instead of W8A32's `-1e9` —
+  the FP16 minimum is large enough to underflow `exp()` to zero in
+  the downstream softmax, so the masking semantics survive intact.
+
+Two important codegen differences from W8A32:
+
+1. **No deferred-V load machinery.** The `_mark_deferred_loads` hook is
+   preserved but no-ops; eager V loading is correct for FP16.
+2. **FP32 → FP16 narrowing replaces flat BUF_COPY out of ACCUM.** The
+   W8A32 codegen moves `M_pad × N_pad` FP32 elements from ACCUM to ABUF
+   via a flat byte copy (4 bytes/element on both sides). In W8A16 the
+   destination element width changes (2 bytes), so a flat copy would
+   scramble the data. The codegen instead emits a `SCALE_MUL` with
+   `scale = 1.0` (sreg 15 is reserved for the constant), which the
+   simulator routes through the same FP32-internal-math / FP16-narrow-
+   on-write path as every other ABUF write. The strip-mined matmul
+   path narrows the whole strip into a temporary ABUF scratchpad and
+   then scatters per-row via FP16-to-FP16 flat BUF_COPY.
+
+The W8A16 load-bearing accuracy gates are slightly looser than W8A32's
+to absorb the per-tensor FP16 narrowing noise compounded across 12
+transformer blocks:
+
+```python
+assert cos_fq   >= 0.998   # vs apply_weight_quantization
+assert cos_fp32 >= 0.997   # vs FP32 HF reference
+```
+
+In practice the implementation clears both gates with substantial
+margin on the same synthetic-pixel test the W8A32 path uses
+(`cos_fq ≈ 0.999997`, `cos_fp32 ≈ 0.998860` at seed 0) — the FP16
+narrowing noise is essentially negligible at the logit-cosine level.
+
 ## Path forward
 
-Once the W8A32 ceiling is locked, the natural follow-ons are:
+Once the W8A16 / W8A32 ceilings are locked, the natural follow-ons are:
 
-- **Mixed-precision exploration**: W8A8 with selective FP32 sites
-  (e.g. only FC1 activations in FP32) to chip away at the 0.17 cosine
-  deficit without paying the full FP32 cost.
+- **Mixed-precision exploration**: W8A8 with selective FP16 / FP32
+  sites (e.g. only FC1 activations in FP32, the rest INT8) to chip
+  away at the 0.17 cosine deficit without paying the full FP cost.
+  W8A16's ~50% DRAM savings vs W8A32 makes FP16 the natural starting
+  point for the activation-side investigation.
 - **W4A8 weight quantization (AWQ)**: orthogonal to this fork; slots
   in via a new `quantize_tensor(bits=4, per_channel=True)` path.
-- **W8A32 RTL rewrite**: if a precision target locks W8A32 as the
-  shipping mode, the RTL needs a FP32 datapath rewrite (systolic INT8 ×
-  FP32, FP32 SFU/helper, REQUANT removal, ABUF widening). Multi-month;
-  out of scope until W8A32 accuracy is proven and a precision target
-  is committed.
+- **FP-datapath RTL rewrite**: if a precision target locks W8A16 or
+  W8A32 as the shipping mode, the RTL needs an FP datapath rewrite
+  (systolic INT8 × FP16/FP32, FP SFU/helper, REQUANT removal, ABUF
+  widening or dtype overlay). Multi-month; out of scope until the
+  precision target is committed. W8A16's FP16-datapath story is more
+  RTL-realistic than W8A32 in modern process nodes.
 
 ## File-layout cheatsheet
 
-| Purpose | W8A8 file | W8A32 file |
-|---|---|---|
-| Compiler entry | `compiler.py::Compiler.compile` | `compiler.py::Compiler.compile_w8a32` |
-| Codegen | `compiler/codegen.py` | `compiler/codegen_w8a32.py` |
-| Seq-tiling policy | `compiler/passes/memory_estimate.py` | `compiler/passes/memory_estimate_w8a32.py` |
-| Simulator | `golden_model/simulator.py` | `golden_model/simulator_w8a32.py` |
-| SFU | `golden_model/sfu.py` | `golden_model/sfu_w8a32.py` |
-| Systolic | `golden_model/systolic.py` | `golden_model/systolic_w8a32.py` |
-| Machine state | `golden_model/state.py::MachineState` | `golden_model/state_w8a32.py::MachineStateW8A32` |
-| Memory helpers | `golden_model/memory.py` (`read_int8_tile`, `read_int32_tile`) | `golden_model/memory.py` (`read_fp32_tile`, `write_fp32_tile`) |
-| Quantizer entry | `quantizer/quantize.py::quantize_tensor` (per-tensor or per-channel) | `quantizer/__init__.py::W8A32_QUANTIZE` (always per-channel) |
-| Benchmark | `tools/benchmark_fp32_vs_int8.py` | `tools/benchmark_w8a32.py` |
-| RTL parity | `tools/batch_compare_rtl_golden.py` | suspended |
+| Purpose | W8A8 file | W8A32 file | W8A16 file |
+|---|---|---|---|
+| Compiler entry | `compiler.py::Compiler.compile` | `compiler.py::Compiler.compile_w8a32` | `compiler.py::Compiler.compile_w8a16` |
+| Codegen | `compiler/codegen.py` | `compiler/codegen_w8a32.py` | `compiler/codegen_w8a16.py` |
+| Seq-tiling policy | `compiler/passes/memory_estimate.py` | `compiler/passes/memory_estimate_w8a32.py` | `compiler/passes/memory_estimate_w8a16.py` |
+| Simulator | `golden_model/simulator.py` | `golden_model/simulator_w8a32.py` | `golden_model/simulator_w8a16.py` |
+| SFU | `golden_model/sfu.py` | `golden_model/sfu_w8a32.py` | `golden_model/sfu_w8a16.py` |
+| Systolic | `golden_model/systolic.py` | `golden_model/systolic_w8a32.py` | `golden_model/systolic_w8a16.py` |
+| Machine state | `golden_model/state.py::MachineState` | `golden_model/state_w8a32.py::MachineStateW8A32` | `golden_model/state_w8a16.py::MachineStateW8A16` |
+| Memory helpers | `memory.py` (`read_int8_tile`, `read_int32_tile`) | `memory.py` (`read_fp32_tile`) | `memory.py` (`read_fp16_tile`, `write_fp16_tile`) |
+| Quantizer entry | `quantizer/quantize.py::quantize_tensor` (per-tensor or per-channel) | `quantizer/__init__.py::W8A32_QUANTIZE` | `quantizer/__init__.py::W8A16_QUANTIZE` (alias of W8A32) |
+| Benchmark | `tools/benchmark_fp32_vs_int8.py` | `tools/benchmark_w8a32.py` | `tools/benchmark_w8a16.py` |
+| RTL parity | `tools/batch_compare_rtl_golden.py` | suspended | suspended |

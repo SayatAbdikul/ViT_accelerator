@@ -92,31 +92,33 @@ transformer_accelerator/
 
 ### Precision-modes parallel layout
 
-The compiler and golden simulator support two precision modes — `w8a8`
-(production / RTL-matched) and `w8a32` (software-only, accuracy
-investigation). The two paths are implemented as **parallel modules**
-that sit beside each other; the production W8A8 files are never edited
-to add W8A32 behaviour.
+The compiler and golden simulator support three precision modes — `w8a8`
+(production / RTL-matched), `w8a32` (software-only FP32 accuracy ceiling),
+and `w8a16` (software-only FP16 middle path). All three are implemented
+as **parallel modules** that sit beside each other; the production W8A8
+files are never edited to add FP behaviour, and the W8A32 files are not
+edited to add W8A16.
 
-| W8A8 path | W8A32 path |
-|---|---|
-| `compiler/codegen.py` | `compiler/codegen_w8a32.py` |
-| `compiler/passes/memory_estimate.py` | `compiler/passes/memory_estimate_w8a32.py` |
-| `golden_model/simulator.py` | `golden_model/simulator_w8a32.py` |
-| `golden_model/sfu.py` | `golden_model/sfu_w8a32.py` |
-| `golden_model/systolic.py` | `golden_model/systolic_w8a32.py` |
-| `golden_model/state.py::MachineState` | `golden_model/state_w8a32.py::MachineStateW8A32` |
-| `Compiler.compile()` | `Compiler(mode='w8a32').compile_w8a32()` |
-| `tools/benchmark_fp32_vs_int8.py` | `tools/benchmark_w8a32.py` |
-| `tools/batch_compare_rtl_golden.py` | (RTL parity suspended) |
+| W8A8 path | W8A32 path | W8A16 path |
+|---|---|---|
+| `compiler/codegen.py` | `compiler/codegen_w8a32.py` | `compiler/codegen_w8a16.py` |
+| `compiler/passes/memory_estimate.py` | `compiler/passes/memory_estimate_w8a32.py` | `compiler/passes/memory_estimate_w8a16.py` |
+| `golden_model/simulator.py` | `golden_model/simulator_w8a32.py` | `golden_model/simulator_w8a16.py` |
+| `golden_model/sfu.py` | `golden_model/sfu_w8a32.py` | `golden_model/sfu_w8a16.py` |
+| `golden_model/systolic.py` | `golden_model/systolic_w8a32.py` | `golden_model/systolic_w8a16.py` |
+| `golden_model/state.py::MachineState` | `golden_model/state_w8a32.py::MachineStateW8A32` | `golden_model/state_w8a16.py::MachineStateW8A16` |
+| `Compiler.compile()` | `Compiler(mode='w8a32').compile_w8a32()` | `Compiler(mode='w8a16').compile_w8a16()` |
+| `tools/benchmark_fp32_vs_int8.py` | `tools/benchmark_w8a32.py` | `tools/benchmark_w8a16.py` |
+| `tools/batch_compare_rtl_golden.py` | (RTL parity suspended) | (RTL parity suspended) |
 
 Activation-calibration modules (`quantizer/calibrate.py`,
 `smooth_quant.py`, `hessian_guided.py`, `twin_uniform.py`,
-`bias_correction.py`) are dormant on the W8A32 path — they only run on
-W8A8 inference. The single canonical W8A32 weight-quant entry point is
-`quantizer.W8A32_QUANTIZE` (per-channel symmetric INT8). See
-`docs/precision_modes.md` for the full motivation, accuracy gates, and
-architectural differences.
+`bias_correction.py`) are dormant on both FP paths — they only run on
+W8A8 inference. The canonical weight-quant entry points are
+`quantizer.W8A32_QUANTIZE` and `quantizer.W8A16_QUANTIZE`, both aliases
+for per-channel symmetric INT8 (the activation precision does not affect
+the weight-side scheme). See `docs/precision_modes.md` for the full
+motivation, accuracy gates, and architectural differences.
 
 ---
 
