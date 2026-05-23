@@ -173,6 +173,47 @@ def write_fp32_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
         buf[byte_offset:end] = flat
 
 
+def read_fp16_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) -> np.ndarray:
+    """Read an FP16 tile from a buffer (W8A16 path).
+
+    ACCUM stays FP32 in W8A16 (the mixed-precision matmul accumulates
+    in FP32), so ACCUM reads belong on ``read_fp32_tile`` — calling
+    this for ACCUM is a programming error and raises.
+    """
+    _check_sram_bounds(buf_id, offset_units)
+    byte_offset = offset_units * UNIT
+
+    if buf_id == BUF_ACCUM:
+        raise ValueError(
+            "ACCUM is FP32 in W8A16 (matmul accumulator); use read_fp32_tile"
+        )
+
+    buf = state.get_buffer(buf_id)
+    total_bytes = rows * cols * 2
+    end = byte_offset + total_bytes
+    if end > len(buf):
+        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+    return np.frombuffer(buf[byte_offset:end], dtype=np.float16).copy().reshape(rows, cols)
+
+
+def write_fp16_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
+    """Write an FP16 tile to a buffer (W8A16 path)."""
+    _check_sram_bounds(buf_id, offset_units)
+    byte_offset = offset_units * UNIT
+
+    if buf_id == BUF_ACCUM:
+        raise ValueError(
+            "ACCUM is FP32 in W8A16 (matmul accumulator); use write_fp32_tile"
+        )
+
+    buf = state.get_buffer(buf_id)
+    flat = data.astype(np.float16).tobytes()
+    end = byte_offset + len(flat)
+    if end > len(buf):
+        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+    buf[byte_offset:end] = flat
+
+
 def read_bytes(state, buf_id: int, offset_units: int, length_bytes: int) -> bytes:
     """Read raw bytes from SRAM buffer."""
     _check_sram_bounds(buf_id, offset_units)
