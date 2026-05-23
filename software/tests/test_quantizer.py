@@ -449,3 +449,71 @@ class TestCalibrationResult:
         result.compute_scales(percentile_overrides={"vit.layernorm": 50.0})
 
         assert result.get_scale("vit.layernorm") == pytest.approx(np.percentile([1.0, 2.0, 3.0, 9.0], 50.0) / 127.0)
+
+
+class TestW8A32QuantizeEntryPoint:
+    """The W8A32 fork's weight-quant contract.
+
+    ``W8A32_QUANTIZE`` is exported from ``taccel.quantizer`` as the single
+    canonical entry point for the W8A32 path. It must be bit-identical to
+    ``fake_quant.apply_weight_quantization`` (which is the reference the
+    plan's accuracy ceiling was achieved against) so the compiler's
+    in-program dequant weights match the fake-quant reference exactly.
+    """
+
+    def test_w8a32_quantize_export_is_importable(self):
+        from taccel.quantizer import W8A32_QUANTIZE
+        assert callable(W8A32_QUANTIZE)
+
+    def test_w8a32_quantize_matches_per_channel_call(self):
+        from taccel.quantizer import W8A32_QUANTIZE
+        np.random.seed(123)
+        w = np.random.randn(48, 96).astype(np.float32) * 2.5
+        q_export, s_export = W8A32_QUANTIZE(w)
+        q_direct, s_direct = quantize_tensor(w, per_channel=True)
+        np.testing.assert_array_equal(q_export, q_direct)
+        np.testing.assert_array_equal(s_export, s_direct)
+
+    def test_w8a32_matches_fake_quant_bitwise(self):
+        """``W8A32_QUANTIZE`` and ``apply_weight_quantization`` must produce
+        bit-identical INT8 tensors and bit-identical dequantized FP32 weights
+        for every Linear/Conv2d weight in a small synthetic model."""
+        from taccel.quantizer import W8A32_QUANTIZE
+        from taccel.quantizer.fake_quant import apply_weight_quantization
+
+        torch.manual_seed(7)
+
+        class Tiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = nn.Linear(64, 96)
+                self.fc2 = nn.Linear(96, 32)
+                self.conv = nn.Conv2d(3, 16, kernel_size=4, stride=2)
+
+            def forward(self, x):
+                return self.fc2(torch.relu(self.fc1(x)))
+
+        model = Tiny()
+        fq_model, count = apply_weight_quantization(model)
+        assert count == 3, "All three weight modules must be quantized"
+
+        # For every Linear/Conv2d module, the dequantized FP32 weight produced
+        # by W8A32_QUANTIZE → dequantize_tensor must match what
+        # apply_weight_quantization wrote into the module.
+        for (name_orig, m_orig), (name_fq, m_fq) in zip(
+            model.named_modules(), fq_model.named_modules()
+        ):
+            assert name_orig == name_fq
+            if not isinstance(m_orig, (nn.Linear, nn.Conv2d)):
+                continue
+            w = m_orig.weight.detach().cpu().numpy().astype(np.float32)
+            orig_shape = w.shape
+            w2 = w.reshape(orig_shape[0], -1) if w.ndim > 2 else w
+            q, scales = W8A32_QUANTIZE(w2)
+            w_dq = dequantize_tensor(q, scales).astype(np.float32).reshape(orig_shape)
+            w_fq = m_fq.weight.detach().cpu().numpy().astype(np.float32)
+            np.testing.assert_array_equal(w_dq, w_fq), (
+                f"{name_orig}: dequant mismatch between W8A32_QUANTIZE and "
+                f"apply_weight_quantization — the bit-equivalence contract "
+                f"that the plan's accuracy ceiling depends on is broken."
+            )

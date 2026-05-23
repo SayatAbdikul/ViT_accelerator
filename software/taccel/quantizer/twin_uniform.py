@@ -4,6 +4,10 @@ These helpers implement software-only quantize-dequant emulation for the
 post-softmax and post-GELU tensors discussed in PTQ4ViT. They do not change the
 accelerator ISA or the stored tensor format; they are intended for search,
 replay, and fake-quant experiments.
+
+Activation-quant-only — dormant on the W8A32 path (post-softmax and post-GELU
+tensors stay FP32 end-to-end there). Retained for the W8A8 production
+pipeline.
 """
 
 from __future__ import annotations

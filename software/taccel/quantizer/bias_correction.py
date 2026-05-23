@@ -1,4 +1,9 @@
-"""Calibration-time analytical bias correction for quantized linear layers."""
+"""Calibration-time analytical bias correction for quantized linear layers.
+
+Activation-quant-only — dormant on the W8A32 path (analytical bias correction
+compensates for activation-quantization mean shift, which does not exist when
+activations stay FP32). Retained for the W8A8 production pipeline.
+"""
 from __future__ import annotations
 
 import re

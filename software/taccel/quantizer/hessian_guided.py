@@ -1,4 +1,10 @@
-"""Lightweight Hessian-guided scoring helpers for PTQ experiments."""
+"""Lightweight Hessian-guided scoring helpers for PTQ experiments.
+
+Activation-quant-only — dormant on the W8A32 path. The Hessian-diagonal
+heuristics target activation-quant error envelopes for GELU and softmax-attn-v;
+W8A32 keeps both tensors FP32, so the scoring helpers are unused there.
+Retained for the W8A8 production pipeline.
+"""
 
 from __future__ import annotations
 
