@@ -79,6 +79,10 @@ class CodeGenerator:
         self.trace_manifest: Dict[int, List[Dict[str, Any]]] = {}
         self.pending_accum_outputs: Dict[str, Dict[str, Any]] = {}
         self.precomputed_nodes: set = set()
+        # Sequence-tiling DRAM staging: symbolic name → DRAM byte offset.
+        # Populated lazily on first reference by tile_load/tile_save/etc;
+        # each region is allocated from the DRAM-temp pool via alloc_dram_temp.
+        self.staging_dram_offsets: Dict[str, int] = {}
 
     def _dram_offset_required(self, name: str, context: str) -> int:
         """Return DRAM offset for a symbol or raise a clear error."""
@@ -276,6 +280,48 @@ class CodeGenerator:
             pass  # No-op, handled by matmul_qkt
         elif op == "concat_heads":
             self._emit_concat_heads(node)
+        # ── Sequence-tiling ops (M2). These move tile-sized slices between
+        # ABUF and a DRAM staging area so ViT-B's [seq, embed] tensors no
+        # longer have to all fit in 128 KB ABUF at once.
+        elif op == "tile_load":
+            self._emit_tile_load(node)
+        elif op == "tile_save":
+            self._emit_tile_save(node)
+        elif op == "init_residual_tile":
+            self._emit_init_residual_tile(node)
+        elif op == "concat_heads_tile":
+            self._emit_concat_heads_tile(node)
+
+    def _resolve_staging_dram(self, name: str, total_bytes: int) -> int:
+        """Allocate (or look up) a DRAM staging region for sequence tiling.
+
+        The region is carved out of the DRAM-temp pool, the same pool the
+        existing strip-mined MLP spills use; staging regions are reused
+        across blocks and live for the program's full duration.
+        """
+        cached = self.staging_dram_offsets.get(name)
+        if cached is not None:
+            return cached
+        off = self.dram_temp_start + self.mem.alloc_dram_temp(name, total_bytes)
+        self.staging_dram_offsets[name] = off
+        return off
+
+    def _calibration_scale(self, name: str, default: float = 6.0 / 127.0) -> float:
+        """Look up a calibration scale, falling back to the un-tiled name.
+
+        The seq_tiling pass introduces tile-specific node names (e.g.
+        ``block0_tile3_ln1``); the calibration dict only has entries keyed by
+        the un-tiled name (``block0_ln1``). We strip ``_tileN_`` and retry so
+        post-tiling compile picks up the same scales the pre-tiling compile
+        would have used.
+        """
+        if name in self.calibration_scales:
+            return self.calibration_scales[name]
+        import re as _re
+        stripped = _re.sub(r"_tile\d+_", "_", name)
+        if stripped != name and stripped in self.calibration_scales:
+            return self.calibration_scales[stripped]
+        return default
 
     def _emit_matmul(self, node: IRNode):
         """Emit a standard linear matmul with optional bias."""
@@ -1820,8 +1866,8 @@ class CodeGenerator:
         """Emit position embedding add."""
         pos_name = node.inputs[1]
         pos_dram = self._dram_offset_required(pos_name, "loading position embeddings")
-        M_pad = pad_dim(197)
-        N = 192
+        M_pad = self.cfg.seq_len_pad
+        N = self.cfg.embed_dim
         N_pad = pad_dim(N)
 
         # Load pos_embed to WBUF [208, 192] (pre-padded at compile time)
@@ -1887,9 +1933,9 @@ class CodeGenerator:
 
     def _emit_cls_extract(self, node: IRNode):
         """Extract CLS token (row 0) via BUF_COPY."""
-        N = 192
+        N = self.cfg.embed_dim
         in_alloc = self.mem.abuf.get(node.inputs[0]) or \
-                   self.mem.abuf.alloc(node.inputs[0], pad_dim(197) * pad_dim(N))
+                   self.mem.abuf.alloc(node.inputs[0], self.cfg.seq_len_pad * pad_dim(N))
         out_alloc = self.mem.abuf.alloc(node.name, pad_dim(N))
         # Copy 192 bytes = 12 × 16-byte units
         self._emit(BufCopyInsn(
@@ -1965,3 +2011,183 @@ class CodeGenerator:
             addr_reg=addr_reg,
             dram_off=0,
         ))
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Sequence-tiling op handlers (M2). These are only emitted when the
+    # seq_tiling pass rewrote the IR — DeiT-tiny compilation never reaches
+    # these branches, so existing programs are byte-identical.
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _emit_tile_load(self, node: IRNode):
+        """Load ``rows × cols`` bytes from a DRAM staging region into ABUF."""
+        rows, cols = node.output_shape
+        M_pad = pad_dim(rows)
+        N_pad = pad_dim(cols)
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
+        src_base = self._resolve_staging_dram(
+            node.attrs["src_dram"], node.attrs["total_dram_bytes"]
+        )
+        src_off = src_base + int(node.attrs.get("src_offset_bytes", 0))
+        # Only DMA the logical bytes; the trailing pad region of the
+        # ABUF allocation stays at whatever was already there (typically
+        # zero — the ABUF BRAM powers up zeroed). LayerNorm and matmul
+        # downstream read M_pad rows but the pad rows contribute zeros to
+        # both the LN reduction (since their input bytes are zero) and to
+        # the matmul accumulator, so the final result is the same as if
+        # we had explicitly zeroed.
+        load_bytes = rows * cols
+        self._emit_dma_load(BUF_ABUF, out_alloc.offset_units, load_bytes, 3, src_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+
+    def _emit_tile_save(self, node: IRNode):
+        """Save ``rows × cols`` bytes from a source SRAM region to DRAM staging.
+
+        The source can live in ABUF (typical case, e.g. Q/K/V projection
+        outputs) or WBUF (the attn_v output, which the existing
+        matmul_attn_v handler requants into WBUF rather than ABUF).
+        """
+        rows, cols = node.output_shape
+        in_name = node.inputs[0]
+        in_alloc = self.mem.abuf.get(in_name)
+        src_buf = BUF_ABUF
+        if in_alloc is None:
+            in_alloc = self.mem.wbuf.get(in_name)
+            src_buf = BUF_WBUF
+        if in_alloc is None:
+            raise KeyError(
+                f"tile_save '{node.name}' missing source allocation '{in_name}' "
+                f"in ABUF or WBUF"
+            )
+        dst_base = self._resolve_staging_dram(
+            node.attrs["dst_dram"], node.attrs["total_dram_bytes"]
+        )
+        dst_off = dst_base + int(node.attrs.get("dst_offset_bytes", 0))
+        save_bytes = rows * cols
+        self._emit_dma_store(src_buf, in_alloc.offset_units, save_bytes, 2, dst_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+        # The generic last-use loop in generate() frees ABUF allocations only;
+        # WBUF allocations are managed by individual handlers. After saving an
+        # attn_v output from WBUF to DRAM staging, explicitly release the WBUF
+        # region so subsequent heads can reuse it.
+        if src_buf == BUF_WBUF:
+            self.mem.wbuf.free(in_name)
+
+    def _emit_init_residual_tile(self, node: IRNode):
+        """Stream one tile of the input residual to its DRAM staging slot.
+
+        Combines cls_prepend + pos_embed_add for a single sequence tile so
+        the full [seq_len_pad, embed_dim] tensor never has to be live in
+        ABUF at once.
+        """
+        tile_idx = int(node.attrs["tile_idx"])
+        tile_rows = int(node.attrs["tile_rows"])
+        logical_rows = int(node.attrs["logical_rows"])
+        cls_name = node.inputs[0]
+        pos_name = node.inputs[1]
+
+        embed = self.cfg.embed_dim
+        num_patches = self.cfg.num_patches
+
+        cls_dram = self._dram_offset_required(cls_name, "init_residual_tile cls")
+        pos_dram = self._dram_offset_required(pos_name, "init_residual_tile pos_embed")
+        patches_dram = self.dram_layout["__input_patches__"]
+
+        seq_row_start = tile_idx * tile_rows
+        # ABUF tile region (sized to tile_rows so M-padding is uniform).
+        tile_bytes = tile_rows * embed
+        scratch_name = f"_init_tile_scratch_{tile_idx}"
+        scratch = self.mem.abuf.alloc(scratch_name, tile_bytes)
+
+        # CLS lives at seq row 0; load it into ABUF row 0 of tile 0.
+        if seq_row_start == 0:
+            self._emit_dma_load(BUF_ABUF, scratch.offset_units, embed, 0, cls_dram)
+            self._emit(SyncInsn(resource_mask=0b001))
+            patches_in_tile = min(logical_rows - 1, num_patches)
+            if patches_in_tile > 0:
+                patch_dst_units = scratch.offset_units + embed // UNIT
+                self._emit_dma_load(
+                    BUF_ABUF, patch_dst_units,
+                    patches_in_tile * embed, 1, patches_dram,
+                )
+                self._emit(SyncInsn(resource_mask=0b001))
+        else:
+            patch_start = seq_row_start - 1  # seq row 1 = patches[0]
+            patches_in_tile = max(0, min(logical_rows, num_patches - patch_start))
+            if patches_in_tile > 0:
+                patch_src = patches_dram + patch_start * embed
+                self._emit_dma_load(
+                    BUF_ABUF, scratch.offset_units,
+                    patches_in_tile * embed, 0, patch_src,
+                )
+                self._emit(SyncInsn(resource_mask=0b001))
+
+        # Pos_embed slice [seq_row_start : seq_row_start+tile_rows] → WBUF.
+        # The quantized pos_embed is pre-padded to seq_len_pad rows, so this
+        # DMA is always in bounds.
+        pos_bytes = tile_rows * embed
+        pos_alloc = self.mem.wbuf.alloc(f"_init_pos_tile{tile_idx}", pos_bytes)
+        pos_src = pos_dram + seq_row_start * embed
+        self._emit_dma_load(BUF_WBUF, pos_alloc.offset_units, pos_bytes, 1, pos_src)
+        self._emit(SyncInsn(resource_mask=0b001))
+
+        # VADD: ABUF[scratch] + WBUF[pos] → ABUF[scratch].
+        m_tiles = tile_rows // TILE
+        n_tiles = pad_dim(embed) // TILE
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+        self._emit(VaddInsn(
+            src1_buf=BUF_ABUF, src1_off=scratch.offset_units,
+            src2_buf=BUF_WBUF, src2_off=pos_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=scratch.offset_units,
+        ))
+        self.mem.wbuf.free(f"_init_pos_tile{tile_idx}")
+
+        # Store the result to the residual staging slot.
+        dst_base = self._resolve_staging_dram(
+            node.attrs["dst_dram"], int(node.attrs["total_dram_bytes"])
+        )
+        dst_off = dst_base + int(node.attrs["dst_offset_bytes"])
+        # Only store logical_rows × embed bytes; the trailing pad rows of
+        # the residual staging region were zero-initialized when the DRAM
+        # temp pool was allocated.
+        self._emit_dma_store(
+            BUF_ABUF, scratch.offset_units,
+            logical_rows * embed, 2, dst_off,
+        )
+        self._emit(SyncInsn(resource_mask=0b001))
+        self.mem.abuf.free(scratch_name)
+
+    def _emit_concat_heads_tile(self, node: IRNode):
+        """Assemble a per-tile [logical_rows, embed_dim] concat from per-head
+        AV stagings via per-row DMAs.
+
+        Each output row at ABUF[r, h*head_dim:(h+1)*head_dim] is filled by
+        a single ``head_dim``-byte DMA from the corresponding row of the
+        head's AV staging region. The per-row DMA count is
+        ``logical_rows × num_heads`` per tile — high but acceptable for M2;
+        future work may fuse heads via a strided DMA descriptor.
+        """
+        tile_idx = int(node.attrs["tile_idx"])
+        tile_rows = int(node.attrs["tile_rows"])
+        logical_rows = int(node.attrs["logical_rows"])
+        head_dim = int(node.attrs["head_dim"])
+        num_heads = int(node.attrs["num_heads"])
+        av_total = int(node.attrs["av_stage_total_bytes"])
+        embed = num_heads * head_dim
+
+        M_pad = pad_dim(logical_rows)
+        N_pad = pad_dim(embed)
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
+
+        for h, stage_name in enumerate(node.inputs):
+            head_base = self._resolve_staging_dram(stage_name, av_total)
+            for r in range(logical_rows):
+                seq_row = tile_idx * tile_rows + r
+                src_off = head_base + seq_row * head_dim
+                dst_off_units = (
+                    out_alloc.offset_units
+                    + (r * embed + h * head_dim) // UNIT
+                )
+                self._emit_dma_load(
+                    BUF_ABUF, dst_off_units, head_dim, 3, src_off,
+                )
+                self._emit(SyncInsn(resource_mask=0b001))

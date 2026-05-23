@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from taccel.isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE  # noqa: E402
 from taccel.model_config import ModelConfig  # noqa: E402
+from taccel.compiler.passes.memory_estimate import decide_seq_tiling  # noqa: E402
 
 
 _MODELS = {
@@ -102,7 +103,27 @@ def report(cfg: ModelConfig, label: str) -> None:
 
     print()
     fits = abuf["largest_single_alloc"] <= ABUF_SIZE
-    print(f"  ABUF fit: {'YES' if fits else 'NO — M2 sequence/feature tiling required'}")
+    print(f"  ABUF fit (untiled): {'YES' if fits else 'NO — sequence tiling required'}")
+
+    # Report M2 sequence-tiling policy.
+    decision = decide_seq_tiling(cfg)
+    if decision.needs_tiling:
+        per_tile = decision.per_tile_bytes
+        print(f"  → M2 seq tiling: tile={decision.tile_rows} rows × "
+              f"{decision.num_tiles} tiles, per-tile residual = "
+              f"{_bytes_pretty(per_tile)}")
+    else:
+        print(f"  → M2 seq tiling: not required ({decision.reason})")
+
+    # Wide-weight WBUF check (M3 boundary).
+    widest_weight = max(
+        cfg.embed_dim * cfg.embed_dim,        # out_proj
+        cfg.embed_dim * cfg.mlp_dim,          # FC1
+        cfg.mlp_dim * cfg.embed_dim,          # FC2
+    )
+    wbuf_fit = widest_weight <= WBUF_SIZE
+    print(f"  WBUF fit (widest weight {_bytes_pretty(widest_weight)}): "
+          f"{'YES' if wbuf_fit else 'NO — M3 weight N-strip mining required'}")
     print()
 
 

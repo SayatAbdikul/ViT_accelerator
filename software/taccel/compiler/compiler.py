@@ -13,6 +13,7 @@ from .ir import IRGraph
 from .graph_extract import extract_vit_graph
 from .codegen import CodeGenerator
 from .tiler import pad_dim
+from .passes import run_passes
 
 
 # Fallback activation scale used when calibration data doesn't cover a node.
@@ -539,6 +540,16 @@ class Compiler:
 
         # Step 5: Extract IR
         graph = extract_vit_graph(self.cfg)
+
+        # Step 5b: Apply IR pass pipeline. For DeiT-tiny the default pipeline
+        # is a no-op (its sequence-tiling pass is gated on the residual
+        # tensor exceeding ABUF/3, which only happens for ViT-B/16 and
+        # larger). For ViT-B the pass rewrites every encoder block into a
+        # sequence-tiled form that streams the residual through DRAM,
+        # keeping the per-tile ABUF footprint within budget without any
+        # RTL changes.
+        pass_ctx: Dict[str, Any] = {"calibration_scales": cal_scales}
+        graph = run_passes(graph, self.cfg, pass_ctx)
 
         # Step 6: Generate code
         codegen = CodeGenerator(
