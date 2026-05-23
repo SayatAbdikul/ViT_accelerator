@@ -14,6 +14,7 @@ Two responsibilities:
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -44,14 +45,27 @@ def _weights_available() -> bool:
     return WEIGHTS_PATH.exists()
 
 
-# ─── Collection-time gate ─────────────────────────────────────────────────────
+# ─── Collection-time gates ────────────────────────────────────────────────────
+# Each block below adds a test module to collect_ignore when its hard
+# prerequisite is missing, so a fresh clone (or a CI job without that
+# prerequisite installed) gets a clean run instead of fixture errors.
+collect_ignore = []
+
 # test_download_imagenet_class.py does `from images.download_imagenet_class
 # import save_class_images` at module scope, which ImportErrors when the
-# gitignored images/ package is missing. Skipping the module at collection
-# time keeps `pytest software/tests` clean on a fresh clone.
-collect_ignore = []
+# gitignored images/ package is missing.
 if not IMAGES_PACKAGE_INIT.exists():
     collect_ignore.append("test_download_imagenet_class.py")
+
+# test_compare_rtl_golden.py has a module-scope autouse fixture that runs
+# `make -C rtl/verilator run_program` to build the Verilator runner; this
+# fails with CalledProcessError on environments without verilator on $PATH
+# (the python-tests CI job, fresh clones, machines that haven't installed
+# Verilator). The 55 tests in that file are integration tests against the
+# RTL — they belong to the verilator/cocotb sign-off path, not the unit
+# suite.
+if shutil.which("verilator") is None:
+    collect_ignore.append("test_compare_rtl_golden.py")
 
 
 def pytest_collection_modifyitems(config, items):

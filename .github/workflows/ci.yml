@@ -54,11 +54,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Verilator (apt)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y verilator
-          verilator --version
+      # Ubuntu's apt package ships Verilator 5.020 (Dec 2023), which can't
+      # handle the SFU engine's `<=` assignments to arrays inside for-loops
+      # (BLKLOOPINIT errors). OSS CAD Suite tracks recent Verilator (5.034+)
+      # and is a single tarball download — much faster than building from
+      # source, and avoids the apt version mismatch.
+      - name: Install Verilator via OSS CAD Suite
+        uses: YosysHQ/setup-oss-cad-suite@v3
+        with:
+          version: "2025-01-01"
+
+      - name: Verilator version check
+        run: verilator --version
 
       - name: SYNTH_BUILD lint gate
         run: make -C rtl/verilator SYNTH_BUILD=1 lint
