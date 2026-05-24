@@ -34,16 +34,6 @@ from .seq_tiling import (
 PassFn = Callable[[IRGraph, ModelConfig, Dict[str, Any]], IRGraph]
 
 
-def default_pipeline() -> List[PassFn]:
-    """Return the canonical pass pipeline.
-
-    Currently only sequence tiling. Each pass is self-gated: if its analysis
-    determines no rewrite is required (e.g. all activations fit in ABUF),
-    it returns the graph unchanged.
-    """
-    return [seq_tiling_pass]
-
-
 def default_pipeline_w8a32() -> List[PassFn]:
     """Pass pipeline for the W8A32 path.
 
@@ -79,10 +69,18 @@ def run_passes(
     if ctx is None:
         ctx = {}
     if pipeline is None:
-        pipeline = default_pipeline()
+        pipeline = default_pipeline_w8a16()
     for pass_fn in pipeline:
         graph = pass_fn(graph, cfg, ctx)
     return graph
 
 
-__all__ = ["run_passes", "default_pipeline", "seq_tiling_pass", "PassFn"]
+__all__ = [
+    "run_passes",
+    "default_pipeline_w8a16",
+    "default_pipeline_w8a32",
+    "seq_tiling_pass",
+    "seq_tiling_pass_w8a16",
+    "seq_tiling_pass_w8a32",
+    "PassFn",
+]

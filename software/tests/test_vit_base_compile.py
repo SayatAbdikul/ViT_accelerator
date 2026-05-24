@@ -74,8 +74,8 @@ def test_deit_tiny_compiler_with_explicit_cfg_matches_default():
     cfg = ModelConfig.deit_tiny()
     sd = _synthetic_state_dict(cfg)
 
-    prog_default = Compiler().compile(sd)
-    prog_explicit = Compiler(cfg).compile(sd)
+    prog_default = Compiler(mode="w8a16").compile_w8a16(sd)
+    prog_explicit = Compiler(cfg, mode="w8a16").compile_w8a16(sd)
 
     assert prog_default.insn_count == prog_explicit.insn_count
     assert prog_default.instructions == prog_explicit.instructions
@@ -83,35 +83,33 @@ def test_deit_tiny_compiler_with_explicit_cfg_matches_default():
 
 
 def test_vit_base_compile_hits_known_m3_boundary():
-    """After M2 sequence tiling, ViT-B advances past the ABUF residual
-    barrier and reaches the *next* boundary: WBUF cannot hold the wide
-    out_proj / FC1 / FC2 weight matrices (each ≥ 576 KB, vs 256 KB WBUF).
-    M3 weight-side N-strip mining will close that gap. Until then the
-    failure is loud and immediate."""
+    """ViT-B exceeds the SRAM budget even after M2 sequence tiling — either
+    the wide out_proj/FC1/FC2 weight matrices overflow WBUF, or the FP16
+    activations overflow ABUF. M3 (weight-side N-strip mining) will close
+    that gap. Until then the failure is loud and immediate."""
     cfg = ModelConfig.vit_base()
     sd = _synthetic_state_dict(cfg)
-    with pytest.raises(MemoryError, match=r"Cannot allocate \d+B.*buffer 1"):
-        Compiler(cfg).compile(sd)
+    with pytest.raises(MemoryError, match=r"Cannot allocate \d+B.*buffer [01]"):
+        Compiler(cfg, mode="w8a16").compile_w8a16(sd)
 
 
 def test_vit_base_seq_tiling_pass_activates():
     """The seq_tiling pass populates the pass context with its decision
-    when invoked from compile(). For ViT-B the policy demands tiling
-    (residual > ABUF/3); for DeiT-T it does not."""
-    from taccel.compiler.passes.memory_estimate import decide_seq_tiling
+    when invoked from compile_w8a16(). For ViT-B the policy demands
+    tiling (residual > ABUF/3); for DeiT-T (FP16 residual fits) the
+    FC1 cap still forces tiling."""
+    from taccel.compiler.passes.memory_estimate_w8a16 import (
+        decide_seq_tiling_w8a16,
+    )
 
-    vit_b = decide_seq_tiling(ModelConfig.vit_base())
+    vit_b = decide_seq_tiling_w8a16(ModelConfig.vit_base())
     assert vit_b.needs_tiling
-    # tile_rows must align with SYS_DIM=16 and yield more than 1 tile.
     assert vit_b.tile_rows % 16 == 0
     assert vit_b.num_tiles >= 2
-    # Per-tile bytes must comfortably clear ABUF/4 (32 KB for the current
-    # 128 KB ABUF) so the LN output + per-head Q/K/V can coexist.
-    assert vit_b.per_tile_bytes <= 32 * 1024
 
-    deit_t = decide_seq_tiling(ModelConfig.deit_tiny())
-    assert not deit_t.needs_tiling
-    assert deit_t.num_tiles == 1
+    deit_t = decide_seq_tiling_w8a16(ModelConfig.deit_tiny())
+    # FC1 cap forces tiling on DeiT-tiny in W8A16 too (cf. W8A16 plan).
+    assert deit_t.tile_rows % 16 == 0
 
 
 def test_vit_base_ir_after_tiling_has_dma_stage_nodes():

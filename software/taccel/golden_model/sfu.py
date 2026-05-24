@@ -29,10 +29,6 @@ import numpy as np
 from . import memory
 from ..isa.opcodes import BUF_ACCUM
 from ..utils import fp32_prim_ref as fpr
-from ..quantizer.twin_uniform import (
-    quantize_dequant_gelu_twin,
-    quantize_dequant_softmax_twin,
-)
 from ..utils.int8_ops import clip_int8
 
 CYCLE_PER_ELEMENT = 2
@@ -168,12 +164,6 @@ def execute_softmax(state, insn):
     exp_x = fpr.fp32_exp_arr(x_shifted)
     denom = fpr.fp32_sum_rows(exp_x)[:, None]
     x_out = (exp_x / denom).astype(np.float32)
-    softmax_spec = _runtime_twin_spec(state, "softmax")
-    if softmax_spec is not None:
-        x_out = quantize_dequant_softmax_twin(
-            x_out,
-            float(softmax_spec.get("range1_max", 1.0)),
-        ).astype(np.float32)
 
     result = fpr.fp32_quantize_i8_arr(x_out, out_scale)
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
@@ -211,13 +201,6 @@ def execute_gelu(state, insn):
     # the old scipy.special.erf path is not hardware-realizable).
     x = x.astype(np.float32)
     x_out = fpr.fp32_gelu_arr(x)
-    gelu_spec = _runtime_twin_spec(state, "gelu")
-    if gelu_spec is not None:
-        x_out = quantize_dequant_gelu_twin(
-            x_out,
-            float(gelu_spec.get("positive_range_max", max(out_scale * 127.0, 1e-8))),
-            negative_extent=float(gelu_spec.get("negative_extent", 1e-8)),
-        ).astype(np.float32)
 
     result = fpr.fp32_quantize_i8_arr(x_out, out_scale)
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
@@ -260,12 +243,6 @@ def execute_softmax_attnv(state, insn):
     qkt_shifted = (qkt - qkt.max(axis=-1, keepdims=True)).astype(np.float32)
     exp_qkt = fpr.fp32_exp_arr(qkt_shifted)
     softmax = (exp_qkt / fpr.fp32_sum_rows(exp_qkt)[:, None]).astype(np.float32)
-    softmax_spec = _runtime_twin_spec(state, "softmax")
-    if softmax_spec is not None:
-        softmax = quantize_dequant_softmax_twin(
-            softmax,
-            float(softmax_spec.get("range1_max", 1.0)),
-        ).astype(np.float32)
     # attn@V as a SEQUENTIAL FP32 fold over k (matches the RTL accumulator),
     # not numpy's pairwise matmul.
     prod = (softmax[:, :, None] * v[None, :, :]).astype(np.float32)

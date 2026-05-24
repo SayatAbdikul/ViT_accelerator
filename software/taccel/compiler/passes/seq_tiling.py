@@ -66,7 +66,7 @@ from typing import Any, Dict, List, Optional
 
 from ..ir import IRGraph, IRNode
 from ...model_config import ModelConfig
-from .memory_estimate import decide_seq_tiling, TilingDecision
+from .memory_estimate import TilingDecision
 from .memory_estimate_w8a32 import decide_seq_tiling_w8a32
 from .memory_estimate_w8a16 import decide_seq_tiling_w8a16
 
@@ -97,12 +97,16 @@ def _av_stage(h: int) -> str:
 def seq_tiling_pass(graph: IRGraph, cfg: ModelConfig, ctx: Dict[str, Any]) -> IRGraph:
     """Rewrite ``graph`` to use sequence-tiled execution when needed.
 
-    DeiT-tiny passes through unchanged (the policy says no tiling). ViT-B
-    and any model whose ``[seq_len_pad, embed_dim]`` activation exceeds
-    ``ABUF_SIZE/3`` gets the rewrite described in the module docstring.
+    The mode-specific dispatchers (:func:`seq_tiling_pass_w8a16`,
+    :func:`seq_tiling_pass_w8a32`) populate ``ctx['seq_tiling_decision']``
+    with a :class:`TilingDecision` before calling this rewriter.
     """
-    decision = ctx.get("seq_tiling_decision") or decide_seq_tiling(cfg)
-    ctx["seq_tiling_decision"] = decision
+    decision = ctx.get("seq_tiling_decision")
+    if decision is None:
+        raise RuntimeError(
+            "seq_tiling_pass requires ctx['seq_tiling_decision']; call "
+            "seq_tiling_pass_w8a16 or seq_tiling_pass_w8a32 instead."
+        )
     if not decision.needs_tiling:
         return graph
 
