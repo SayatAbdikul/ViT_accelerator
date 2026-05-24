@@ -1,104 +1,95 @@
-"""cocotb helper-engine tests for Phase C and Stage E helper ops."""
+"""cocotb tests for the W8A16 blocking helper engine.
 
-import math
+The helper engine supports:
+  * BUF_COPY  — flat byte copy and FP16-element transpose.
+  * VADD      — FP16 + FP16 → FP16 (ABUF mode) and FP32 + FP16-broadcast →
+                FP32 (ACCUM bias / attention-mask mode).
+  * SCALE_MUL — FP32-internal × FP16 scale, narrowed to FP16 when dst=ABUF,
+                kept FP32 when dst=ACCUM.
+
+Removed in W8A16 (raises FAULT_UNSUPPORTED_OP): REQUANT (0x0B),
+REQUANT_PC (0x11), DEQUANT_ADD (0x13).
+
+Bit-exact oracles use fp32_prim_ref to match RTL fp32_prim_pkg byte-for-byte.
+
+Requires SIM=verilator: fp32_prim_pkg uses constructs Icarus iverilog cannot
+parse.
+"""
+
+import os
+import sys
 
 import cocotb
+import numpy as np
 
-from utils.dram_model import DramModel
+# Make the repo's `software/` package importable when cocotb runs from rtl/cocotb.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from software.taccel.utils import fp32_prim_ref as fpr  # noqa: E402
+
 from utils.insn_builder import (
-    HALT, SYNC, CONFIG_TILE, SET_SCALE, SET_ADDR_LO, SET_ADDR_HI,
-    LOAD, STORE, BUF_COPY, MATMUL, REQUANT, REQUANT_PC, SCALE_MUL, VADD, DEQUANT_ADD,
+    HALT, SYNC, CONFIG_TILE, SET_SCALE, LOAD, STORE,
+    BUF_COPY, SCALE_MUL, VADD, REQUANT, REQUANT_PC, DEQUANT_ADD,
     BUF_ABUF, BUF_WBUF, BUF_ACCUM,
 )
-from utils.systolic_contract import prepare_logical_16x16
 from utils.testbench import set_addr, setup_test, wait_halt
 
 
-def _sat_add(a: int, b: int) -> int:
-    s = a + b
-    if s > 127:
-        return 127
-    if s < -128:
-        return -128
-    return s
+def _fp16_bytes(arr) -> bytes:
+    return np.ascontiguousarray(arr, dtype=np.float16).tobytes()
 
 
-def _fp16_mul_round_even(src: int, fp16: int) -> int:
-    sign = (fp16 >> 15) & 1
-    exp = (fp16 >> 10) & 0x1F
-    frac = fp16 & 0x3FF
-    if exp == 0 and frac == 0:
-        return 0
-    if exp == 0:
-        mant = frac
-        shift = -24
-    else:
-        mant = 1024 + frac
-        shift = exp - 25
-    prod = src * mant
-    if sign:
-        prod = -prod
-    if shift >= 0:
-        return prod << shift
-    rshift = -shift
-    abs_prod = -prod if prod < 0 else prod
-    q = abs_prod >> rshift
-    rem = abs_prod & ((1 << rshift) - 1)
-    half = 1 << (rshift - 1)
-    if rem > half or (rem == half and (q & 1)):
-        q += 1
-    return -q if prod < 0 else q
+def _fp32_bytes(arr) -> bytes:
+    return np.ascontiguousarray(arr, dtype=np.float32).tobytes()
 
 
-def _requant(src: int, scale: int) -> int:
-    scaled = _fp16_mul_round_even(src, scale)
-    if scaled > 127:
-        return 127
-    if scaled < -128:
-        return -128
-    return scaled
+def _assert_bytes_equal(got: bytes, exp: bytes, tag: str):
+    if got != exp:
+        diff_idx = next(i for i in range(min(len(got), len(exp))) if got[i] != exp[i])
+        ctx_lo = max(0, diff_idx - 4)
+        ctx_hi = min(len(got), diff_idx + 8)
+        raise AssertionError(
+            f"{tag}: first mismatch at byte {diff_idx} "
+            f"(got=0x{got[diff_idx]:02x} exp=0x{exp[diff_idx]:02x}); "
+            f"got[{ctx_lo}:{ctx_hi}]={got[ctx_lo:ctx_hi].hex()} "
+            f"exp[{ctx_lo}:{ctx_hi}]={exp[ctx_lo:ctx_hi].hex()}"
+        )
 
 
-def _fp16_to_float(bits: int) -> float:
-    bits = int(bits)
-    sign = (bits >> 15) & 1
-    exp = (bits >> 10) & 0x1F
-    frac = bits & 0x3FF
-    sign_v = -1.0 if sign else 1.0
-    if exp == 0 and frac == 0:
-        return 0.0
-    if exp == 0:
-        return sign_v * (frac / 1024.0) * (2.0 ** -14)
-    if exp == 31:
-        return sign_v * 65504.0
-    return sign_v * (1.0 + frac / 1024.0) * (2.0 ** (exp - 15))
+def _fp16_add_oracle(a_fp16: np.ndarray, b_fp16: np.ndarray) -> np.ndarray:
+    """Match RTL VADD ABUF: widen each to FP32, add, narrow to FP16."""
+    a_b = a_fp16.astype(np.float32)
+    b_b = b_fp16.astype(np.float32)
+    return (a_b + b_b).astype(np.float16)
 
 
-def _round_half_even(x: float) -> int:
-    floor_i = math.floor(x)
-    frac = x - floor_i
-    if frac > 0.5:
-        return floor_i + 1
-    if frac < 0.5:
-        return floor_i
-    return floor_i + 1 if (floor_i & 1) else floor_i
+def _fp32_bias_add_oracle(accum_fp32: np.ndarray, bias_fp16: np.ndarray) -> np.ndarray:
+    """Match RTL VADD ACCUM: FP32 + FP16-widened-broadcast → FP32."""
+    return (accum_fp32 + bias_fp16.astype(np.float32)).astype(np.float32)
 
 
-def _dequant_add(accum: int, skip: int, accum_scale: int, skip_scale: int) -> int:
-    x = accum * _fp16_to_float(accum_scale) + skip * _fp16_to_float(skip_scale)
-    q = _round_half_even(x)
-    return max(-128, min(127, q))
+def _fp16_scale_oracle(x_fp16: np.ndarray, scale_fp16: np.float16) -> np.ndarray:
+    """ABUF→ABUF SCALE_MUL: widen, mul, narrow."""
+    return (x_fp16.astype(np.float32) * np.float32(scale_fp16)).astype(np.float16)
 
 
-def _pack_i32_le(vals):
-    out = bytearray()
-    for v in vals:
-        out.extend(int(v & 0xFFFFFFFF).to_bytes(4, "little", signed=False))
-    return bytes(out)
+def _fp32_scale_oracle(x_fp32: np.ndarray, scale_fp16: np.float16) -> np.ndarray:
+    """ACCUM→ACCUM SCALE_MUL: stays FP32 (scale widened from FP16)."""
+    return (x_fp32 * np.float32(scale_fp16)).astype(np.float32)
 
+
+def _accum_to_abuf_oracle(x_fp32: np.ndarray, scale_fp16: np.float16) -> np.ndarray:
+    """ACCUM→ABUF SCALE_MUL: FP32-mul then FP16 narrow."""
+    return (x_fp32 * np.float32(scale_fp16)).astype(np.float16)
+
+
+# ─── BUF_COPY ──────────────────────────────────────────────────────────────
 
 @cocotb.test()
 async def test_buf_copy_flat_roundtrip(dut):
+    """Flat BUF_COPY preserves bytes between buffers."""
     src_addr = 0x10000
     dst_addr = 0x12000
     src = bytes((0x20 + 7 * i) & 0xFF for i in range(48))
@@ -120,6 +111,7 @@ async def test_buf_copy_flat_roundtrip(dut):
 
 @cocotb.test()
 async def test_buf_copy_overlap_roundtrip(dut):
+    """Backward memmove for overlapping in-place compaction."""
     src_addr = 0x14000
     dst_addr = 0x15000
     src = bytearray((0x51 + 11 * i) & 0xFF for i in range(96))
@@ -142,231 +134,402 @@ async def test_buf_copy_overlap_roundtrip(dut):
 
 
 @cocotb.test()
-async def test_buf_copy_transpose_unaligned_roundtrip(dut):
+async def test_buf_copy_transpose_fp16_roundtrip(dut):
+    """FP16-element transpose: [16, 16] FP16 → [16, 16] FP16.
+
+    The codegen emits BUF_COPY transpose to make K^T from K (FP16); the RTL
+    must treat 16-byte SRAM rows as 8 FP16 elements and transpose at element
+    granularity, not byte granularity.
+    """
     src_addr = 0x18000
     dst_addr = 0x19000
-    rows, cols = 16, 18
-    src = bytearray(rows * cols)
-    expected = bytearray(cols * rows)
-    for r in range(rows):
-        for c in range(cols):
-            src[r * cols + c] = (r * 19 + c * 7 + 3) & 0xFF
-            expected[c * rows + r] = src[r * cols + c]
+    rows, cols = 16, 16  # both multiples of 8 elements
+    rng = np.random.default_rng(101)
+    src_arr = rng.uniform(-3.0, 3.0, (rows, cols)).astype(np.float16)
+    expected = np.ascontiguousarray(src_arr.T)
+    src_bytes = src_arr.tobytes()
+    # length in 16-byte units = total_bytes / 16; src_rows in 16-row units.
+    length_units = (rows * cols * 2) // 16
+    src_rows_field = rows // 16
     prog = [
         *set_addr(0, src_addr),
-        LOAD(BUF_ABUF, 0, 18, 0, 0),
+        LOAD(BUF_ABUF, 0, length_units, 0, 0),
         SYNC(0b001),
-        BUF_COPY(BUF_ABUF, 0, BUF_WBUF, 0, 18, 1, 1),
+        BUF_COPY(BUF_ABUF, 0, BUF_WBUF, 0, length_units, src_rows_field, 1),
         *set_addr(1, dst_addr),
-        STORE(BUF_WBUF, 0, 18, 1, 0),
+        STORE(BUF_WBUF, 0, length_units, 1, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await setup_test(dut, prog, dram_writes={src_addr: bytes(src)})
+    dram = await setup_test(dut, prog, dram_writes={src_addr: src_bytes})
     await wait_halt(dut, max_cycles=400_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
-    assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        expected.tobytes(),
+        "transpose-fp16",
+    )
 
 
 @cocotb.test()
-async def test_vadd_int8_roundtrip(dut):
-    src_a_addr = 0x1A000
-    src_b_addr = 0x1B000
+async def test_buf_copy_transpose_fp16_rect(dut):
+    """Rectangular FP16 transpose: [32, 16] → [16, 32]."""
+    src_addr = 0x1B000
     dst_addr = 0x1C000
-    src_a = bytearray(256)
-    src_b = bytearray(256)
-    expected = bytearray(256)
-    for i in range(256):
-        a = 120 if i % 5 == 0 else -120 if i % 7 == 0 else (i % 17) - 8
-        b = 30 if i % 5 == 0 else -30 if i % 7 == 0 else (i % 11) - 5
-        src_a[i] = a & 0xFF
-        src_b[i] = b & 0xFF
-        expected[i] = _sat_add(a, b) & 0xFF
+    rows, cols = 32, 16
+    rng = np.random.default_rng(202)
+    src_arr = rng.uniform(-2.0, 2.0, (rows, cols)).astype(np.float16)
+    expected = np.ascontiguousarray(src_arr.T)
+    src_bytes = src_arr.tobytes()
+    length_units = (rows * cols * 2) // 16
+    src_rows_field = rows // 16
+    prog = [
+        *set_addr(0, src_addr),
+        LOAD(BUF_ABUF, 0, length_units, 0, 0),
+        SYNC(0b001),
+        BUF_COPY(BUF_ABUF, 0, BUF_WBUF, 0, length_units, src_rows_field, 1),
+        *set_addr(1, dst_addr),
+        STORE(BUF_WBUF, 0, length_units, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await setup_test(dut, prog, dram_writes={src_addr: src_bytes})
+    await wait_halt(dut, max_cycles=400_000)
+    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        expected.tobytes(),
+        "transpose-rect",
+    )
+
+
+# ─── VADD ──────────────────────────────────────────────────────────────────
+
+@cocotb.test()
+async def test_vadd_fp16_abuf(dut):
+    """VADD ABUF+WBUF → ABUF: FP16 + FP16 → FP16 (bit-exact)."""
+    src_a_addr = 0x1D000
+    src_b_addr = 0x1E000
+    dst_addr = 0x1F000
+    M, N = 16, 16
+    rng = np.random.default_rng(303)
+    a_fp16 = rng.uniform(-3.0, 3.0, (M, N)).astype(np.float16)
+    b_fp16 = rng.uniform(-3.0, 3.0, (M, N)).astype(np.float16)
+    expected = _fp16_add_oracle(a_fp16, b_fp16)
+
+    # FP16 row count = M * N / 8.
+    rows_units = (M * N * 2) // 16
     prog = [
         *set_addr(0, src_a_addr),
-        LOAD(BUF_ABUF, 0, 16, 0, 0),
+        LOAD(BUF_ABUF, 0, rows_units, 0, 0),
         SYNC(0b001),
         *set_addr(1, src_b_addr),
-        LOAD(BUF_WBUF, 0, 16, 1, 0),
+        LOAD(BUF_WBUF, 0, rows_units, 1, 0),
         SYNC(0b001),
-        CONFIG_TILE(1, 1, 1),
-        VADD(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ABUF, 32, 0),
+        CONFIG_TILE(M // 16, N // 16, 1),
+        VADD(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ABUF, rows_units, 0),
         *set_addr(2, dst_addr),
-        STORE(BUF_ABUF, 32, 16, 2, 0),
+        STORE(BUF_ABUF, rows_units, rows_units, 2, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await setup_test(dut, prog, dram_writes={src_a_addr: bytes(src_a), src_b_addr: bytes(src_b)})
+    dram = await setup_test(dut, prog,
+                            dram_writes={src_a_addr: _fp16_bytes(a_fp16),
+                                         src_b_addr: _fp16_bytes(b_fp16)})
     await wait_halt(dut, max_cycles=400_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
-    assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        _fp16_bytes(expected),
+        "vadd-fp16",
+    )
 
 
 @cocotb.test()
-async def test_requant_roundtrip(dut):
-    src_addr = 0x1D000
-    dst_addr = 0x1E000
-    scale = 0x3800
-    pattern = [1, 3, 5, -1, -3, -5, 255, 257, -255, -257, 300, -300, 0, 2, -2, 7]
-    src = []
-    expected = bytearray(256)
-    for r in range(16):
-        for c in range(16):
-            v = pattern[c] + r
-            src.append(v)
-            expected[r * 16 + c] = _requant(v, scale) & 0xFF
-    prog = [
-        *set_addr(0, src_addr),
-        LOAD(BUF_ACCUM, 0, 64, 0, 0),
-        SYNC(0b001),
-        CONFIG_TILE(1, 1, 1),
-        SET_SCALE(0, scale),
-        REQUANT(BUF_ACCUM, 0, BUF_ABUF, 64, 0),
-        *set_addr(1, dst_addr),
-        STORE(BUF_ABUF, 64, 16, 1, 0),
-        SYNC(0b001),
-        HALT(),
-    ]
-    dram = await setup_test(dut, prog, dram_writes={src_addr: _pack_i32_le(src)})
-    await wait_halt(dut, max_cycles=500_000)
-    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
-    assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
+async def test_vadd_accum_bias_broadcast(dut):
+    """VADD ACCUM+WBUF → ACCUM: FP32 + FP16-broadcast row → FP32 (bit-exact).
 
-
-@cocotb.test()
-async def test_matmul_then_requant_roundtrip(dut):
-    src_a_addr = 0x20000
-    src_b_addr = 0x21000
+    The bias FP16 row spans 2 ACCUM 4-column chunks per M row; this exercises
+    the c4_half_q half-row selection in H_VACC_WRITE.
+    """
+    accum_addr = 0x20000
+    bias_addr = 0x21000
     dst_addr = 0x22000
-    a = [[(i * 5 + j) - 20 for j in range(16)] for i in range(16)]
-    eye = [[1 if i == j else 0 for j in range(16)] for i in range(16)]
+    M, N = 16, 16
+    rng = np.random.default_rng(404)
+    accum_fp32 = rng.uniform(-5.0, 5.0, (M, N)).astype(np.float32)
+    bias_fp16 = rng.uniform(-1.0, 1.0, (N,)).astype(np.float16)
+    expected = _fp32_bias_add_oracle(accum_fp32, bias_fp16)
 
-    expected = bytearray()
-    for r in range(16):
-        for c in range(16):
-            expected.append(a[r][c] & 0xFF)
-
-    prog = []
-    dram = DramModel()
-    prepare_logical_16x16(dram, prog, a, eye, src_a_addr, src_b_addr, abuf_off=128, wbuf_off=0)
-    prog.extend([
-        CONFIG_TILE(1, 1, 1),
-        MATMUL(BUF_ABUF, 128, BUF_WBUF, 0, BUF_ACCUM, 0, 0),
-        SYNC(0b010),
-        SET_SCALE(0, 0x3C00),
-        REQUANT(BUF_ACCUM, 0, BUF_ABUF, 256, 0),
-        *set_addr(2, dst_addr),
-        STORE(BUF_ABUF, 256, 16, 2, 0),
-        SYNC(0b001),
-        HALT(),
-    ])
-    await setup_test(dut, prog, dram=dram)
-    await wait_halt(dut, max_cycles=600_000)
-    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
-    assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
-
-
-@cocotb.test()
-async def test_requant_pc_roundtrip(dut):
-    src_addr = 0x23000
-    scale_addr = 0x24000
-    dst_addr = 0x25000
-    dst_off = 96
-    src = []
-    scales = []
-    expected = bytearray(256)
-    for c in range(16):
-        scales.append(0x3C00 if c % 4 == 0 else 0x3800 if c % 4 == 1 else 0xBC00 if c % 4 == 2 else 0x0000)
-    for r in range(16):
-        for c in range(16):
-            v = (c - 6) * 37 + r * 5
-            src.append(v)
-            expected[r * 16 + c] = _requant(v, scales[c]) & 0xFF
-    scale_bytes = b"".join(int(s & 0xFFFF).to_bytes(2, "little") for s in scales)
-    prog = [
-        *set_addr(0, src_addr),
-        LOAD(BUF_ACCUM, 0, 64, 0, 0),
-        SYNC(0b001),
-        *set_addr(1, scale_addr),
-        LOAD(BUF_WBUF, 320, 2, 1, 0),
-        SYNC(0b001),
-        CONFIG_TILE(1, 1, 1),
-        REQUANT_PC(BUF_ACCUM, 0, BUF_WBUF, 320, BUF_ABUF, dst_off, 0),
-        *set_addr(2, dst_addr),
-        STORE(BUF_ABUF, dst_off, 16, 2, 0),
-        SYNC(0b001),
-        HALT(),
-    ]
-    dram = await setup_test(dut, prog, dram_writes={src_addr: _pack_i32_le(src), scale_addr: scale_bytes})
-    await wait_halt(dut, max_cycles=600_000)
-    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
-    assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
-
-
-@cocotb.test()
-async def test_scale_mul_int8_roundtrip(dut):
-    src_addr = 0x26000
-    dst_addr = 0x27000
-    dst_off = 128
-    scale = 0xB800  # -0.5
-    src = bytearray(256)
-    expected = bytearray(256)
-    for i in range(256):
-        v = ((i * 9) % 61) - 30
-        src[i] = v & 0xFF
-        expected[i] = _requant(v, scale) & 0xFF
-    prog = [
-        *set_addr(0, src_addr),
-        LOAD(BUF_ABUF, 0, 16, 0, 0),
-        SYNC(0b001),
-        CONFIG_TILE(1, 1, 1),
-        SET_SCALE(2, scale),
-        SCALE_MUL(BUF_ABUF, 0, BUF_WBUF, dst_off, 2),
-        *set_addr(1, dst_addr),
-        STORE(BUF_WBUF, dst_off, 16, 1, 0),
-        SYNC(0b001),
-        HALT(),
-    ]
-    dram = await setup_test(dut, prog, dram_writes={src_addr: bytes(src)})
-    await wait_halt(dut, max_cycles=500_000)
-    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
-    assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
-
-
-@cocotb.test()
-async def test_dequant_add_roundtrip(dut):
-    accum_addr = 0x28000
-    skip_addr = 0x29000
-    dst_addr = 0x2A000
-    dst_off = 192
-    acc_scale = 0x2C00
-    skip_scale = 0x3400
-    accum = []
-    skip = bytearray(256)
-    expected = bytearray(256)
-    for i in range(256):
-        accum_v = (i - 120) * 11
-        skip_v = ((i * 5) % 29) - 14
-        accum.append(accum_v)
-        skip[i] = skip_v & 0xFF
-        expected[i] = _dequant_add(accum_v, skip_v, acc_scale, skip_scale) & 0xFF
+    accum_rows = (M * N * 4) // 16   # FP32 -> 4 lanes per 16-byte row
+    bias_rows = (N * 2) // 16        # one FP16 row of N cols
+    out_off = 256
     prog = [
         *set_addr(0, accum_addr),
-        LOAD(BUF_ACCUM, 0, 64, 0, 0),
+        LOAD(BUF_ACCUM, 0, accum_rows, 0, 0),
         SYNC(0b001),
-        *set_addr(1, skip_addr),
-        LOAD(BUF_ABUF, 0, 16, 1, 0),
+        *set_addr(1, bias_addr),
+        LOAD(BUF_WBUF, 0, bias_rows, 1, 0),
         SYNC(0b001),
-        CONFIG_TILE(1, 1, 1),
-        SET_SCALE(4, acc_scale),
-        SET_SCALE(5, skip_scale),
-        DEQUANT_ADD(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, dst_off, 4),
+        CONFIG_TILE(M // 16, N // 16, 1),
+        VADD(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ACCUM, out_off, 0),
         *set_addr(2, dst_addr),
-        STORE(BUF_WBUF, dst_off, 16, 2, 0),
+        STORE(BUF_ACCUM, out_off, accum_rows, 2, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await setup_test(dut, prog, dram_writes={accum_addr: _pack_i32_le(accum), skip_addr: bytes(skip)})
-    await wait_halt(dut, max_cycles=600_000)
+    dram = await setup_test(dut, prog,
+                            dram_writes={accum_addr: _fp32_bytes(accum_fp32),
+                                         bias_addr: _fp16_bytes(bias_fp16)})
+    await wait_halt(dut, max_cycles=400_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
-    assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        _fp32_bytes(expected),
+        "vadd-bias-fp32",
+    )
+
+
+@cocotb.test()
+async def test_vadd_attention_mask_underflow(dut):
+    """The W8A16 codegen broadcasts an FP16 mask row (-65504 in padded cols)
+    via VADD ACCUM+WBUF. After downstream softmax the masked positions must
+    bit-exactly underflow to FP16 +0.0. Here we just verify the FP32 ACCUM
+    bit pattern carries -65504 (FP16 widened) into masked columns and 0.0
+    elsewhere.
+    """
+    accum_addr = 0x23000
+    bias_addr = 0x24000
+    dst_addr = 0x25000
+    M, N = 16, 16
+    accum_fp32 = np.zeros((M, N), dtype=np.float32)
+    mask_fp16 = np.zeros(N, dtype=np.float16)
+    mask_fp16[N // 2:] = np.float16(-65504.0)
+    expected = _fp32_bias_add_oracle(accum_fp32, mask_fp16)
+
+    accum_rows = (M * N * 4) // 16
+    bias_rows = (N * 2) // 16
+    out_off = 384
+    prog = [
+        *set_addr(0, accum_addr),
+        LOAD(BUF_ACCUM, 0, accum_rows, 0, 0),
+        SYNC(0b001),
+        *set_addr(1, bias_addr),
+        LOAD(BUF_WBUF, 0, bias_rows, 1, 0),
+        SYNC(0b001),
+        CONFIG_TILE(M // 16, N // 16, 1),
+        VADD(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ACCUM, out_off, 0),
+        *set_addr(2, dst_addr),
+        STORE(BUF_ACCUM, out_off, accum_rows, 2, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await setup_test(dut, prog,
+                            dram_writes={accum_addr: _fp32_bytes(accum_fp32),
+                                         bias_addr: _fp16_bytes(mask_fp16)})
+    await wait_halt(dut, max_cycles=400_000)
+    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        _fp32_bytes(expected),
+        "vadd-attn-mask",
+    )
+
+
+# ─── SCALE_MUL ─────────────────────────────────────────────────────────────
+
+@cocotb.test()
+async def test_scale_mul_abuf_fp16(dut):
+    """SCALE_MUL ABUF → ABUF (FP16 widen × scale, narrow). 1-read-1-write."""
+    src_addr = 0x26000
+    dst_addr = 0x27000
+    M, N = 16, 16
+    scale_fp16 = np.float16(-0.5)
+    scale_bits = int(scale_fp16.view(np.uint16))
+    rng = np.random.default_rng(505)
+    x_fp16 = rng.uniform(-2.0, 2.0, (M, N)).astype(np.float16)
+    expected = _fp16_scale_oracle(x_fp16, scale_fp16)
+
+    rows_units = (M * N * 2) // 16
+    out_off = 128
+    prog = [
+        *set_addr(0, src_addr),
+        LOAD(BUF_ABUF, 0, rows_units, 0, 0),
+        SYNC(0b001),
+        CONFIG_TILE(M // 16, N // 16, 1),
+        SET_SCALE(2, scale_bits),
+        SCALE_MUL(BUF_ABUF, 0, BUF_ABUF, out_off, 2),
+        *set_addr(1, dst_addr),
+        STORE(BUF_ABUF, out_off, rows_units, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await setup_test(dut, prog, dram_writes={src_addr: _fp16_bytes(x_fp16)})
+    await wait_halt(dut, max_cycles=400_000)
+    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        _fp16_bytes(expected),
+        "scale-mul-fp16",
+    )
+
+
+@cocotb.test()
+async def test_scale_mul_accum_fp32(dut):
+    """SCALE_MUL ACCUM → ACCUM (FP32 × FP16-widened scale). 1-read-1-write."""
+    src_addr = 0x28000
+    dst_addr = 0x29000
+    M, N = 16, 16
+    scale_fp16 = np.float16(3.0)
+    scale_bits = int(scale_fp16.view(np.uint16))
+    rng = np.random.default_rng(606)
+    x_fp32 = rng.uniform(-10.0, 10.0, (M, N)).astype(np.float32)
+    expected = _fp32_scale_oracle(x_fp32, scale_fp16)
+
+    rows_units = (M * N * 4) // 16
+    out_off = 256
+    prog = [
+        *set_addr(0, src_addr),
+        LOAD(BUF_ACCUM, 0, rows_units, 0, 0),
+        SYNC(0b001),
+        CONFIG_TILE(M // 16, N // 16, 1),
+        SET_SCALE(3, scale_bits),
+        SCALE_MUL(BUF_ACCUM, 0, BUF_ACCUM, out_off, 3),
+        *set_addr(1, dst_addr),
+        STORE(BUF_ACCUM, out_off, rows_units, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await setup_test(dut, prog, dram_writes={src_addr: _fp32_bytes(x_fp32)})
+    await wait_halt(dut, max_cycles=400_000)
+    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        _fp32_bytes(expected),
+        "scale-mul-fp32",
+    )
+
+
+@cocotb.test()
+async def test_scale_mul_accum_to_abuf_narrow(dut):
+    """SCALE_MUL ACCUM → ABUF: FP32 × scale → FP16 narrow (2-reads-1-write).
+
+    This is the W8A16 _accum_to_abuf commit path with scale=1.0; the codegen
+    uses sreg 15. The 2-read-1-write FSM combines 2 ACCUM rows (8 FP32
+    columns) into 1 ABUF row (8 FP16 columns).
+    """
+    src_addr = 0x2A000
+    dst_addr = 0x2B000
+    M, N = 16, 16
+    scale_fp16 = np.float16(1.0)
+    scale_bits = int(scale_fp16.view(np.uint16))
+    rng = np.random.default_rng(707)
+    x_fp32 = rng.uniform(-100.0, 100.0, (M, N)).astype(np.float32)
+    expected = _accum_to_abuf_oracle(x_fp32, scale_fp16)
+
+    accum_rows = (M * N * 4) // 16
+    abuf_rows = (M * N * 2) // 16
+    out_off = 320
+    prog = [
+        *set_addr(0, src_addr),
+        LOAD(BUF_ACCUM, 0, accum_rows, 0, 0),
+        SYNC(0b001),
+        CONFIG_TILE(M // 16, N // 16, 1),
+        SET_SCALE(4, scale_bits),
+        SCALE_MUL(BUF_ACCUM, 0, BUF_ABUF, out_off, 4),
+        *set_addr(1, dst_addr),
+        STORE(BUF_ABUF, out_off, abuf_rows, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await setup_test(dut, prog, dram_writes={src_addr: _fp32_bytes(x_fp32)})
+    await wait_halt(dut, max_cycles=400_000)
+    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        _fp16_bytes(expected),
+        "scale-mul-narrow",
+    )
+
+
+@cocotb.test()
+async def test_scale_mul_accum_to_abuf_nonunit_scale(dut):
+    """SCALE_MUL ACCUM → ABUF with scale ≠ 1.0 (covers the scale multiply
+    in the narrowing path; ensures fp32_mul_bits is wired correctly)."""
+    src_addr = 0x2C000
+    dst_addr = 0x2D000
+    M, N = 16, 16
+    scale_fp16 = np.float16(0.25)
+    scale_bits = int(scale_fp16.view(np.uint16))
+    rng = np.random.default_rng(808)
+    x_fp32 = rng.uniform(-50.0, 50.0, (M, N)).astype(np.float32)
+    expected = _accum_to_abuf_oracle(x_fp32, scale_fp16)
+
+    accum_rows = (M * N * 4) // 16
+    abuf_rows = (M * N * 2) // 16
+    out_off = 448
+    prog = [
+        *set_addr(0, src_addr),
+        LOAD(BUF_ACCUM, 0, accum_rows, 0, 0),
+        SYNC(0b001),
+        CONFIG_TILE(M // 16, N // 16, 1),
+        SET_SCALE(5, scale_bits),
+        SCALE_MUL(BUF_ACCUM, 0, BUF_ABUF, out_off, 5),
+        *set_addr(1, dst_addr),
+        STORE(BUF_ABUF, out_off, abuf_rows, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await setup_test(dut, prog, dram_writes={src_addr: _fp32_bytes(x_fp32)})
+    await wait_halt(dut, max_cycles=400_000)
+    assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
+    _assert_bytes_equal(
+        bytes(dram.mem[dst_addr:dst_addr + expected.nbytes]),
+        _fp16_bytes(expected),
+        "scale-mul-narrow-quarter",
+    )
+
+
+# ─── Dropped opcodes raise FAULT_UNSUPPORTED_OP ────────────────────────────
+
+async def _expect_fault(dut, prog):
+    await setup_test(dut, prog)
+    await wait_halt(dut, max_cycles=8000)
+    assert int(dut.fault.value) == 1
+    assert int(dut.fault_code.value) == 0x6  # FAULT_UNSUPPORTED_OP
+
+
+@cocotb.test()
+async def test_requant_raises_fault(dut):
+    """OP_REQUANT (0x0B) is unsupported in W8A16 RTL."""
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        SET_SCALE(0, 0x3C00),
+        REQUANT(BUF_ACCUM, 0, BUF_ABUF, 0, 0),
+        HALT(),
+    ]
+    await _expect_fault(dut, prog)
+
+
+@cocotb.test()
+async def test_requant_pc_raises_fault(dut):
+    """OP_REQUANT_PC (0x11) is unsupported in W8A16 RTL."""
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        REQUANT_PC(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ABUF, 0, 0),
+        HALT(),
+    ]
+    await _expect_fault(dut, prog)
+
+
+@cocotb.test()
+async def test_dequant_add_raises_fault(dut):
+    """OP_DEQUANT_ADD (0x13) is unsupported in W8A16 RTL."""
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        SET_SCALE(0, 0x3C00),
+        SET_SCALE(1, 0x3C00),
+        DEQUANT_ADD(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 0, 0),
+        HALT(),
+    ]
+    await _expect_fault(dut, prog)

@@ -213,28 +213,72 @@ async def test_buf_copy_same_buffer_transpose_fault(dut):
 
 
 @cocotb.test()
-async def test_stage_e_ops_dispatch_no_fault(dut):
-    """Stage E helper/SFU instructions now execute instead of faulting unsupported."""
+async def test_scale_mul_dispatch_no_fault(dut):
+    """SCALE_MUL on FP16 buffers (ABUF↔WBUF) and on ACCUM→ACCUM should
+    dispatch cleanly in W8A16. REQUANT_PC / DEQUANT_ADD / SOFTMAX_ATTNV
+    were dropped from W8A16 and are tested under separate fault tests."""
     dram, _ = await init_dut(dut)
     prog = [
         CONFIG_TILE(1, 1, 1),
-        REQUANT_PC(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ABUF, 0, sreg=0, flags=0),
         SET_SCALE(2, 0x3800),
         SCALE_MUL(BUF_ABUF, 0, BUF_WBUF, 32, sreg=2, flags=0),
-        SET_SCALE(4, 0x2C00),
-        SET_SCALE(5, 0x3400),
-        DEQUANT_ADD(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 64, sreg=4, flags=0),
-        SET_SCALE(8, 0x3400),
-        SET_SCALE(9, 0x3400),
-        SET_SCALE(10, 0x3400),
-        SET_SCALE(11, 0x3000),
-        SOFTMAX_ATTNV(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 96, sreg=8, flags=0),
+        SET_SCALE(3, 0x3C00),
+        SCALE_MUL(BUF_ACCUM, 0, BUF_ACCUM, 0, sreg=3, flags=0),
         SYNC(0b100),
         HALT(),
     ]
     done, fault, _, _ = await run_program(dut, dram, prog, timeout_cycles=20000)
     assert done == 1
     assert fault == 0
+
+
+@cocotb.test()
+async def test_requant_pc_unsupported(dut):
+    """REQUANT_PC (0x11) was dropped in W8A16 — must raise FAULT_UNSUPPORTED_OP."""
+    dram, _ = await init_dut(dut)
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        REQUANT_PC(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ABUF, 0, sreg=0, flags=0),
+        HALT(),
+    ]
+    done, fault, fault_code, _ = await run_program(dut, dram, prog, timeout_cycles=20000)
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
+
+
+@cocotb.test()
+async def test_dequant_add_unsupported(dut):
+    """DEQUANT_ADD (0x13) was dropped in W8A16."""
+    dram, _ = await init_dut(dut)
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        SET_SCALE(4, 0x2C00),
+        SET_SCALE(5, 0x3400),
+        DEQUANT_ADD(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 64, sreg=4, flags=0),
+        HALT(),
+    ]
+    done, fault, fault_code, _ = await run_program(dut, dram, prog, timeout_cycles=20000)
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
+
+
+@cocotb.test()
+async def test_softmax_attnv_unsupported(dut):
+    """SOFTMAX_ATTNV (0x12) was dropped in W8A16."""
+    dram, _ = await init_dut(dut)
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        SET_SCALE(8, 0x3400),
+        SOFTMAX_ATTNV(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 96, sreg=8, flags=0),
+        SYNC(0b100),
+        HALT(),
+    ]
+    done, fault, fault_code, _ = await run_program(dut, dram, prog, timeout_cycles=20000)
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
 
 
 @cocotb.test()

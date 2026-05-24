@@ -203,52 +203,51 @@ static void test_illegal_opcode() {
 }
 
 // ============================================================================
-// Test: Stage E helper/SFU paths are now legal and complete cleanly
+// Test: W8A16 surviving paths halt cleanly; dropped Stage E opcodes raise
+// FAULT_UNSUPPORTED_OP.
+//
+// In the W8A8 era, REQUANT_PC / DEQUANT_ADD / SOFTMAX_ATTNV were valid
+// helper/SFU dispatches. The W8A16 fork drops them — they remain legal ISA
+// encodings but are rejected with FAULT_UNSUPPORTED_OP (code 6) by the
+// helper engine (Phase 4) and SFU (Phase 3). Phase 5 will hoist the
+// rejection into decode_unit; until then the engines themselves catch it.
 // ============================================================================
-static void test_stage_e_paths() {
-    struct StageECase {
-        const char* name;
-        std::vector<uint64_t> prog;
-    };
-    const StageECase cases[] = {
-        { "requant_pc_dispatch", {
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::REQUANT_PC(2, 0, 1, 0, 0, 0, 0),
-            insn::HALT()
-        }},
-        { "scale_mul_dispatch", {
+static void test_w8a16_dispatch_paths() {
+    // SCALE_MUL ACCUM -> ACCUM is the in-place scale path used by codegen
+    // (e.g. 1/sqrt(d_head) after QK^T). It must halt cleanly in W8A16.
+    {
+        const char* name = "scale_mul_accum_dispatch";
+        SimHarness s;
+        s.load({
             insn::CONFIG_TILE(1, 1, 1),
             insn::SET_SCALE(2, 0x3800),
-            insn::SCALE_MUL(0, 0, 1, 0, 2),
-            insn::HALT()
-        }},
-        { "dequant_add_dispatch", {
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::SET_SCALE(4, 0x2C00),
-            insn::SET_SCALE(5, 0x3400),
-            insn::DEQUANT_ADD(2, 0, 0, 0, 1, 0, 4),
-            insn::HALT()
-        }},
-        { "softmax_attnv_dispatch_sync", {
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::SET_SCALE(8, 0x3400),
-            insn::SET_SCALE(9, 0x3400),
-            insn::SET_SCALE(10, 0x3400),
-            insn::SET_SCALE(11, 0x3000),
-            insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 8),
-            insn::SYNC(0b100),
-            insn::HALT()
-        }},
-    };
-
-    for (const auto& tc : cases) {
-        SimHarness s;
-        s.load(tc.prog);
+            insn::SCALE_MUL(2, 0, 2, 0, 2),  // ACCUM -> ACCUM
+            insn::HALT(),
+        });
         s.run(100000);
-        EXPECT(s.dut->done == 1, "stage E path should halt cleanly");
-        EXPECT(s.dut->fault == 0, "stage E path should not fault");
-        TEST_PASS(tc.name);
+        EXPECT(s.dut->done == 1, "scale_mul ACCUM->ACCUM should halt cleanly");
+        EXPECT(s.dut->fault == 0, "scale_mul ACCUM->ACCUM should not fault");
+        TEST_PASS(name);
     }
+
+    expect_fault_program("requant_pc_unsupported",
+        { insn::CONFIG_TILE(1, 1, 1),
+          insn::REQUANT_PC(2, 0, 1, 0, 0, 0, 0),
+          insn::HALT() }, 6, 5000);
+
+    expect_fault_program("dequant_add_unsupported",
+        { insn::CONFIG_TILE(1, 1, 1),
+          insn::SET_SCALE(4, 0x2C00),
+          insn::SET_SCALE(5, 0x3400),
+          insn::DEQUANT_ADD(2, 0, 0, 0, 1, 0, 4),
+          insn::HALT() }, 6, 5000);
+
+    expect_fault_program("softmax_attnv_unsupported",
+        { insn::CONFIG_TILE(1, 1, 1),
+          insn::SET_SCALE(8, 0x3400),
+          insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 8),
+          insn::SYNC(0b100),
+          insn::HALT() }, 6, 5000);
 }
 
 // ============================================================================
@@ -477,7 +476,7 @@ int main(int argc, char** argv) {
     test_sync_nop();
     test_sync_all_idle();
     test_illegal_opcode();
-    test_stage_e_paths();
+    test_w8a16_dispatch_paths();
     test_sfu_no_config_faults();
     test_sfu_dispatch_paths();
     test_set_scale_from_buffer_unsupported();

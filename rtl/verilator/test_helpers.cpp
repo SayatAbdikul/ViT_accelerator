@@ -1,19 +1,33 @@
-// Verilator helper-engine tests for Phase C.
+// Verilator tests for the W8A16 blocking helper engine.
+//
+// Operations under test:
+//   * BUF_COPY  — flat copy and FP16-element-aware transpose.
+//   * VADD      — FP16 + FP16 → FP16 (ABUF) and FP32 + FP16-broadcast → FP32
+//                 (ACCUM bias / attention-mask).
+//   * SCALE_MUL — FP32 × FP16-widened scale, narrowed to FP16 on ABUF dst or
+//                 kept FP32 on ACCUM dst.
+//
+// Bit-exactness: every arithmetic step uses standard IEEE binary32 in both
+// the C++ oracle and the RTL (fp32_prim_pkg's mul/add are correctly rounded),
+// and the FP16 narrow uses RNE in both. Expect 0 ULPs on FP16 outputs and
+// exact 32-bit equality on FP32 ACCUM outputs.
+//
+// The load-bearing bit-exact gate against fp32_prim_ref lives in
+// rtl/cocotb/test_helpers.py.
 
 #include "Vtaccel_top.h"
 #include "Vtaccel_top___024root.h"
 #include "verilated.h"
-#include "include/systolic_test_utils.h"
 #include "include/testbench.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <vector>
 
 static int tests_run  = 0;
@@ -22,147 +36,135 @@ static int tests_pass = 0;
 #define TEST_PASS(name) do { \
     printf("PASS: %s\n", name); tests_pass++; tests_run++; } while(0)
 #define TEST_FAIL(name, msg) do { \
-    fprintf(stderr, "FAIL: %s — %s\n", name, msg); std::exit(1); } while(0)
+    fprintf(stderr, "FAIL: %s - %s\n", name, msg); std::exit(1); } while(0)
 
 using tbutil::SimHarness;
-using tbutil::sram_write_row;
-using tbutil::sram_read_row;
 using tbutil::sram_write_bytes;
 using tbutil::sram_read_bytes;
-using tbutil::pack_i32_le;
-using tbutil::pack_u16_le;
-using tbutil::unpack_i32_le;
 constexpr int BUF_ABUF_ID  = tbutil::BUF_ABUF_ID;
 constexpr int BUF_WBUF_ID  = tbutil::BUF_WBUF_ID;
 constexpr int BUF_ACCUM_ID = tbutil::BUF_ACCUM_ID;
 
-static int8_t sat_add_ref(int8_t a, int8_t b) {
-    int sum = int(a) + int(b);
-    if (sum > 127) return int8_t(127);
-    if (sum < -128) return int8_t(-128);
-    return int8_t(sum);
+namespace {
+
+// ───── FP16 ↔ FP32 helpers (match RTL fp32_to_fp16_bits / fp32_from_fp16_bits) ─────
+
+uint32_t float_bits(float f) {
+    uint32_t b;
+    std::memcpy(&b, &f, sizeof(b));
+    return b;
 }
 
-static int64_t fp16_mul_round_even_ref(int32_t src, uint16_t fp16_val) {
-    bool sign = (fp16_val >> 15) & 1;
-    uint32_t exp = (fp16_val >> 10) & 0x1F;
-    uint32_t frac = fp16_val & 0x3FF;
-    if (exp == 0 && frac == 0)
-        return 0;
+float bits_float(uint32_t b) {
+    float f;
+    std::memcpy(&f, &b, sizeof(f));
+    return f;
+}
 
-    int32_t shift = 0;
-    int64_t mant = 0;
-    if (exp == 0) {
-        mant = int64_t(frac);
-        shift = -24;
-    } else {
-        mant = int64_t(1024 + frac);
-        shift = int32_t(exp) - 25;
+float fp16_to_fp32(uint16_t h) {
+    uint32_t s = (h >> 15) & 1u;
+    uint32_t e = (h >> 10) & 0x1Fu;
+    uint32_t f = h & 0x3FFu;
+    if (e == 0 && f == 0)
+        return bits_float(s << 31);
+    if (e == 0) {
+        int k = 31 - __builtin_clz(f);
+        uint32_t bits = (s << 31) | (uint32_t)((k + 103) << 23) |
+                       (uint32_t)(((f - (1u << k)) << (23 - k)) & 0x7FFFFFu);
+        return bits_float(bits);
     }
-
-    int64_t prod = int64_t(src) * mant;
-    if (sign)
-        prod = -prod;
-
-    if (shift >= 0)
-        return prod << shift;
-
-    int rshift = -shift;
-    int64_t abs_prod = prod < 0 ? -prod : prod;
-    int64_t q = abs_prod >> rshift;
-    int64_t rem = abs_prod & ((int64_t(1) << rshift) - 1);
-    int64_t half = int64_t(1) << (rshift - 1);
-    if (rem > half || (rem == half && (q & 1)))
-        q += 1;
-    return prod < 0 ? -q : q;
+    if (e == 0x1F) {
+        return bits_float(s ? 0xC77FE000u : 0x477FE000u);
+    }
+    return bits_float((s << 31) | ((e + 112u) << 23) | (f << 13));
 }
 
-static double fp16_to_double_ref(uint16_t bits) {
-    bool sign = (bits >> 15) & 1;
-    int exp = (bits >> 10) & 0x1F;
-    int frac = bits & 0x3FF;
-    double sign_v = sign ? -1.0 : 1.0;
-    if (exp == 0 && frac == 0)
-        return 0.0;
-    if (exp == 0)
-        return sign_v * (double(frac) / 1024.0) * std::ldexp(1.0, -14);
-    if (exp == 31)
-        return sign_v * 65504.0;
-    return sign_v * (1.0 + double(frac) / 1024.0) * std::ldexp(1.0, exp - 15);
+uint16_t fp32_to_fp16(float v) {
+    uint32_t f = float_bits(v);
+    uint32_t s   = (f >> 31) & 1u;
+    uint32_t e8  = (f >> 23) & 0xFFu;
+    uint32_t f23 = f & 0x7FFFFFu;
+    if (e8 == 0xFFu && f23 != 0u)
+        return (uint16_t)((s << 15) | (0x1Fu << 10) | 0x200u);
+    if (e8 == 0xFFu)
+        return (uint16_t)((s << 15) | (0x1Fu << 10));
+    if (e8 == 0u)
+        return (uint16_t)(s << 15);
+    int e_unb = (int)e8 - 127;
+    uint64_t mant24 = (1ULL << 23) | (uint64_t)f23;
+    auto rshift_rne = [](uint64_t value, int shift) -> uint64_t {
+        if (shift <= 0) return value << (-shift);
+        if (shift >= 63) {
+            uint64_t half = 1ULL << 63;
+            return (value > half) ? 1ULL : 0ULL;
+        }
+        uint64_t q = value >> shift;
+        uint64_t mask = (1ULL << shift) - 1ULL;
+        uint64_t r = value & mask;
+        uint64_t half = 1ULL << (shift - 1);
+        if (r > half || (r == half && (q & 1ULL))) return q + 1ULL;
+        return q;
+    };
+    if (e_unb > 15) return (uint16_t)((s << 15) | (0x1Fu << 10));
+    if (e_unb >= -14) {
+        uint64_t rounded = rshift_rne(mant24, 13);
+        if (rounded == 0x800ULL) {
+            if (e_unb + 1 > 15) return (uint16_t)((s << 15) | (0x1Fu << 10));
+            return (uint16_t)((s << 15) | (uint32_t)((e_unb + 1 + 15) << 10));
+        }
+        return (uint16_t)((s << 15) | (uint32_t)((e_unb + 15) << 10) |
+                          (uint32_t)(rounded & 0x3FFu));
+    }
+    int shift_amt = 13 + (-14 - e_unb);
+    uint64_t rounded = rshift_rne(mant24, shift_amt);
+    if (rounded == 0x400ULL) return (uint16_t)((s << 15) | (1u << 10));
+    return (uint16_t)((s << 15) | (uint32_t)(rounded & 0x3FFu));
 }
 
-static int round_half_even_ref(double x) {
-    long long floor_i = static_cast<long long>(std::floor(x));
-    double frac = x - static_cast<double>(floor_i);
-    if (frac > 0.5)
-        return int(floor_i + 1);
-    if (frac < 0.5)
-        return int(floor_i);
-    return (floor_i & 1LL) ? int(floor_i + 1) : int(floor_i);
+std::vector<uint8_t> pack_fp16(const std::vector<float>& v) {
+    std::vector<uint8_t> out(v.size() * 2);
+    for (size_t i = 0; i < v.size(); ++i) {
+        uint16_t h = fp32_to_fp16(v[i]);
+        out[i * 2 + 0] = uint8_t(h & 0xFF);
+        out[i * 2 + 1] = uint8_t((h >> 8) & 0xFF);
+    }
+    return out;
 }
 
-static int8_t requant_ref(int32_t src, uint16_t scale) {
-    int64_t scaled = fp16_mul_round_even_ref(src, scale);
-    if (scaled > 127) return int8_t(127);
-    if (scaled < -128) return int8_t(-128);
-    return int8_t(scaled);
+std::vector<uint8_t> pack_fp32(const std::vector<float>& v) {
+    std::vector<uint8_t> out(v.size() * 4);
+    for (size_t i = 0; i < v.size(); ++i) {
+        uint32_t b = float_bits(v[i]);
+        for (int k = 0; k < 4; ++k)
+            out[i * 4 + k] = uint8_t((b >> (k * 8)) & 0xFF);
+    }
+    return out;
 }
 
-static int8_t scale_mul_i8_ref(int8_t src, uint16_t scale) {
-    return requant_ref(int32_t(src), scale);
-}
-
-static int32_t scale_mul_i32_ref(int32_t src, uint16_t scale) {
-    int64_t scaled = fp16_mul_round_even_ref(src, scale);
-    if (scaled > int64_t(INT32_MAX)) return INT32_MAX;
-    if (scaled < int64_t(INT32_MIN)) return INT32_MIN;
-    return int32_t(scaled);
-}
-
-static int8_t dequant_add_ref(int32_t accum, int8_t skip,
-                              uint16_t accum_scale, uint16_t skip_scale) {
-    double x = double(accum) * fp16_to_double_ref(accum_scale) +
-               double(skip) * fp16_to_double_ref(skip_scale);
-    int q = round_half_even_ref(x);
-    if (q > 127) return int8_t(127);
-    if (q < -128) return int8_t(-128);
-    return int8_t(q);
-}
-
-static void expect_fault_program(const char* name,
-                                 const std::vector<uint64_t>& prog,
-                                 uint32_t expected_fault_code,
-                                 int timeout = 5000) {
-    SimHarness s;
-    s.load(prog);
-    s.run(timeout);
-    EXPECT(s.dut->fault == 1, "fault should assert");
-    EXPECT(s.dut->done == 0, "done should remain low");
-    EXPECT(s.dut->fault_code == expected_fault_code, "unexpected fault code");
-    TEST_PASS(name);
-}
-
-static int32_t read_accum_ij(Vtaccel_top* dut, int dst_off, int i, int j) {
-    auto* r = dut->rootp;
-    int grp = j / 4;
-    int lane = j % 4;
-    int row = dst_off + i * 4 + grp;
-    uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row][lane];
-    return int32_t(word);
-}
-
-static void matmul_ref(const int8_t a[16][16], const int8_t b[16][16], int32_t c[16][16]) {
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            int32_t acc = 0;
-            for (int k = 0; k < 16; ++k)
-                acc += int32_t(a[i][k]) * int32_t(b[k][j]);
-            c[i][j] = acc;
+void expect_bytes_equal(const char* name, const std::vector<uint8_t>& got,
+                        const std::vector<uint8_t>& exp) {
+    if (got.size() != exp.size())
+        TEST_FAIL(name, "size mismatch");
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != exp[i]) {
+            fprintf(stderr, "%s: first byte mismatch at idx=%zu got=0x%02x exp=0x%02x\n",
+                    name, i, got[i], exp[i]);
+            TEST_FAIL(name, "byte mismatch");
         }
     }
 }
 
-static void test_buf_copy_flat_interbuffer() {
+void expect_clean_halt(const char* name, Vtaccel_top* dut) {
+    if (!dut->done || dut->fault)
+        TEST_FAIL(name, "did not halt cleanly");
+}
+
+// FP16-snap a float so the oracle works on the same FP16 patterns as the RTL.
+float fp16_snap(float v) { return fp16_to_fp32(fp32_to_fp16(v)); }
+
+// ───── BUF_COPY ──────────────────────────────────────────────────────────
+
+void test_buf_copy_flat_interbuffer() {
     const char* name = "buf_copy_flat_interbuffer";
     SimHarness s;
     std::vector<uint8_t> src(48);
@@ -175,14 +177,13 @@ static void test_buf_copy_flat_interbuffer() {
         insn::HALT(),
     });
     s.run();
-
-    EXPECT(s.dut->done == 1 && s.dut->fault == 0, "copy should halt cleanly");
+    expect_clean_halt(name, s.dut.get());
     auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, 10 * 16, src.size());
-    if (got != src) TEST_FAIL(name, "flat copy mismatch");
+    expect_bytes_equal(name, got, src);
     TEST_PASS(name);
 }
 
-static void test_buf_copy_overlap_compaction() {
+void test_buf_copy_overlap_compaction() {
     const char* name = "buf_copy_overlap_compaction";
     SimHarness s;
     std::vector<uint8_t> bytes(6 * 16);
@@ -197,463 +198,351 @@ static void test_buf_copy_overlap_compaction() {
         insn::HALT(),
     });
     s.run();
-
-    EXPECT(s.dut->done == 1 && s.dut->fault == 0, "overlap copy should halt cleanly");
+    expect_clean_halt(name, s.dut.get());
     auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 0, bytes.size());
-    if (got != expected) TEST_FAIL(name, "overlap compaction mismatch");
+    expect_bytes_equal(name, got, expected);
     TEST_PASS(name);
 }
 
-static void test_buf_copy_zero_length() {
-    const char* name = "buf_copy_zero_length";
-    SimHarness s;
-    std::vector<uint8_t> before(64);
-    for (size_t i = 0; i < before.size(); ++i)
-        before[i] = uint8_t((0x91 + 13 * i) & 0xFF);
-    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 8 * 16, before);
-
-    s.load({
-        insn::BUF_COPY(BUF_ABUF_ID, 0, BUF_WBUF_ID, 8, 0, 0, 0),
-        insn::HALT(),
-    });
-    s.run();
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, 8 * 16, before.size());
-    if (got != before) TEST_FAIL(name, "zero-length copy modified memory");
-    TEST_PASS(name);
-}
-
-static void test_buf_copy_transpose_unaligned_source() {
-    const char* name = "buf_copy_transpose_unaligned_source";
+void test_buf_copy_transpose_fp16_square() {
+    const char* name = "buf_copy_transpose_fp16_square";
     SimHarness s;
     constexpr int rows = 16;
-    constexpr int cols = 18;
-    std::vector<uint8_t> src(rows * cols);
-    std::vector<uint8_t> expected(cols * rows);
+    constexpr int cols = 16;
+    std::vector<float> src_f((size_t)rows * cols);
+    std::mt19937 rng(101);
+    std::uniform_real_distribution<float> ud(-3.0f, 3.0f);
+    for (auto& v : src_f) v = fp16_snap(ud(rng));
+
+    // Element transpose at FP16 granularity.
+    std::vector<float> dst_f((size_t)cols * rows);
     for (int r = 0; r < rows; ++r)
-        for (int c = 0; c < cols; ++c) {
-            src[r * cols + c] = uint8_t((r * 19 + c * 7 + 3) & 0xFF);
-            expected[c * rows + r] = src[r * cols + c];
-        }
+        for (int c = 0; c < cols; ++c)
+            dst_f[size_t(c) * rows + r] = src_f[size_t(r) * cols + c];
 
-    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src);
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, pack_fp16(src_f));
+    int length_units = (rows * cols * 2) / 16;
+    int src_rows_field = rows / 16;
     s.load({
-        insn::BUF_COPY(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 18, 1, 1),
-        insn::HALT(),
-    });
-    s.run(100000);
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, 0, expected.size());
-    if (got != expected) TEST_FAIL(name, "transpose mismatch");
-    TEST_PASS(name);
-}
-
-static void test_buf_copy_transpose_same_buffer_fault() {
-    expect_fault_program("buf_copy_transpose_same_buffer_fault",
-                         { insn::BUF_COPY(BUF_ABUF_ID, 0, BUF_ABUF_ID, 32, 16, 1, 1) }, 6, 5000);
-}
-
-static void test_vadd_int8_saturating() {
-    const char* name = "vadd_int8_saturating";
-    SimHarness s;
-    std::vector<uint8_t> src_a(256), src_b(256), expected(256);
-    for (int i = 0; i < 256; ++i) {
-        int8_t a = (i % 5 == 0) ? int8_t(120) :
-                   (i % 7 == 0) ? int8_t(-120) : int8_t((i % 17) - 8);
-        int8_t b = (i % 5 == 0) ? int8_t(30) :
-                   (i % 7 == 0) ? int8_t(-30) : int8_t((i % 11) - 5);
-        src_a[i] = uint8_t(a);
-        src_b[i] = uint8_t(b);
-        expected[i] = uint8_t(sat_add_ref(a, b));
-    }
-
-    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src_a);
-    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 0, src_b);
-    s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::VADD(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, BUF_ABUF_ID, 32, 0),
-        insn::HALT(),
-    });
-    s.run(100000);
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 32 * 16, expected.size());
-    if (got != expected) TEST_FAIL(name, "INT8 VADD mismatch");
-    TEST_PASS(name);
-}
-
-static void test_vadd_bias_int32_wrap() {
-    const char* name = "vadd_bias_int32_wrap";
-    SimHarness s;
-    std::vector<int32_t> accum(16 * 16), bias(16), expected(16 * 16);
-    for (int i = 0; i < 16 * 16; ++i)
-        accum[i] = (i % 9 == 0) ? int32_t(0x7FFFFFF0u) :
-                   (i % 13 == 0) ? int32_t(0x80000010u) :
-                   int32_t((i * 97) - 3000);
-    for (int j = 0; j < 16; ++j)
-        bias[j] = (j % 4 == 0) ? int32_t(0x30u) :
-                  (j % 5 == 0) ? int32_t(0xFFFFFFE0u) :
-                  int32_t(j * 11 - 40);
-
-    for (int r = 0; r < 16; ++r)
-        for (int c = 0; c < 16; ++c)
-            expected[r * 16 + c] = int32_t(uint32_t(accum[r * 16 + c]) + uint32_t(bias[c]));
-
-    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(accum));
-    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 200 * 16, pack_i32_le(bias));
-    s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::VADD(BUF_ACCUM_ID, 0, BUF_WBUF_ID, 200, BUF_ACCUM_ID, 128, 0),
-        insn::HALT(),
-    });
-    s.run(120000);
-
-    auto got = unpack_i32_le(sram_read_bytes(s.dut.get(), BUF_ACCUM_ID, 128 * 16, expected.size() * 4ULL));
-    if (got != expected) TEST_FAIL(name, "bias VADD mismatch");
-    TEST_PASS(name);
-}
-
-static void test_requant_rounding_and_clipping() {
-    const char* name = "requant_rounding_and_clipping";
-    SimHarness s;
-    constexpr uint16_t SCALE_HALF = 0x3800; // 0.5
-    const int32_t pattern[16] = {
-        1, 3, 5, -1, -3, -5, 255, 257,
-        -255, -257, 300, -300, 0, 2, -2, 7
-    };
-    std::vector<int32_t> src(16 * 16);
-    std::vector<uint8_t> expected(16 * 16);
-    for (int r = 0; r < 16; ++r) {
-        for (int c = 0; c < 16; ++c) {
-            int32_t v = pattern[c] + r;
-            src[r * 16 + c] = v;
-            expected[r * 16 + c] = uint8_t(requant_ref(v, SCALE_HALF));
-        }
-    }
-
-    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
-    s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::SET_SCALE(0, SCALE_HALF),
-        insn::REQUANT(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 64, 0),
-        insn::HALT(),
-    });
-    s.run(120000);
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 64 * 16, expected.size());
-    if (got != expected) TEST_FAIL(name, "requant rounding mismatch");
-    TEST_PASS(name);
-}
-
-static void test_requant_subnormal_negative_zero() {
-    const char* name = "requant_subnormal_negative_zero";
-    SimHarness s;
-    constexpr uint16_t SCALE_SUBN = 0x0001;
-    constexpr uint16_t SCALE_NEG1 = 0xBC00;
-    std::vector<int32_t> src(16 * 16, 0);
-    std::vector<uint8_t> expected_subn(16 * 16, 0);
-    std::vector<uint8_t> expected_neg(16, 0);
-
-    const int32_t row0[16] = {
-        1 << 23, 3 << 23, -(1 << 23), -(3 << 23),
-        1, -1, 0, 4 << 23,
-        -(4 << 23), 5 << 23, -(5 << 23), 127,
-        -127, 128, -128, 1000
-    };
-    for (int c = 0; c < 16; ++c) {
-        src[c] = row0[c];
-        expected_subn[c] = uint8_t(requant_ref(row0[c], SCALE_SUBN));
-    }
-    for (int c = 0; c < 16; ++c) {
-        src[16 + c] = c - 8;
-        expected_subn[16 + c] = uint8_t(requant_ref(src[16 + c], SCALE_SUBN));
-        expected_neg[c] = uint8_t(requant_ref(src[16 + c], SCALE_NEG1));
-    }
-
-    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
-    s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::SET_SCALE(0, SCALE_SUBN),
-        insn::REQUANT(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 128, 0),
-        insn::SET_SCALE(0, SCALE_NEG1),
-        insn::REQUANT(BUF_ACCUM_ID, 4, BUF_WBUF_ID, 256, 0),
-        insn::SET_SCALE(0, 0x0000),
-        insn::REQUANT(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 160, 0),
+        insn::BUF_COPY(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0,
+                       length_units, src_rows_field, 1),
         insn::HALT(),
     });
     s.run(200000);
-
-    auto got_subn = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 128 * 16, 256);
-    if (!std::equal(expected_subn.begin(), expected_subn.end(), got_subn.begin())) {
-        for (size_t i = 0; i < expected_subn.size(); ++i) {
-            if (expected_subn[i] != got_subn[i]) {
-                fprintf(stderr, "subnormal mismatch idx=%zu got=%d exp=%d\n",
-                        i, int(got_subn[i]), int(expected_subn[i]));
-                break;
-            }
-        }
-        TEST_FAIL(name, "subnormal requant mismatch");
-    }
-    auto got_neg = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, 256 * 16, 256);
-    if (!std::equal(expected_neg.begin(), expected_neg.end(), got_neg.begin())) {
-        for (size_t i = 0; i < 16; ++i) {
-            if (expected_neg[i] != got_neg[i]) {
-                fprintf(stderr, "negative mismatch idx=%zu got=%d exp=%d\n",
-                        i, int(got_neg[i]), int(expected_neg[i]));
-                break;
-            }
-        }
-        TEST_FAIL(name, "negative requant mismatch");
-    }
-    auto got_zero = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 160 * 16, 256);
-    if (!std::all_of(got_zero.begin(), got_zero.end(), [](uint8_t v) { return v == 0; }))
-        TEST_FAIL(name, "zero-scale requant mismatch");
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, 0, dst_f.size() * 2);
+    expect_bytes_equal(name, got, pack_fp16(dst_f));
     TEST_PASS(name);
 }
 
-static void test_requant_pc_per_column() {
-    const char* name = "requant_pc_per_column";
+void test_buf_copy_transpose_fp16_rect() {
+    const char* name = "buf_copy_transpose_fp16_rect";
     SimHarness s;
-    constexpr int SCALE_OFF = 320;
-    constexpr int DST_OFF = 512;
-    std::vector<int32_t> src(16 * 16);
-    std::vector<uint16_t> scales(16);
-    std::vector<uint8_t> expected(16 * 16);
+    constexpr int rows = 32;
+    constexpr int cols = 16;
+    std::vector<float> src_f((size_t)rows * cols);
+    std::mt19937 rng(202);
+    std::uniform_real_distribution<float> ud(-2.0f, 2.0f);
+    for (auto& v : src_f) v = fp16_snap(ud(rng));
 
-    for (int c = 0; c < 16; ++c)
-        scales[c] = (c % 4 == 0) ? 0x3C00 :
-                    (c % 4 == 1) ? 0x3800 :
-                    (c % 4 == 2) ? 0xBC00 : 0x0000;
-    for (int r = 0; r < 16; ++r) {
-        for (int c = 0; c < 16; ++c) {
-            int32_t v = (c - 6) * 37 + r * 5;
-            src[r * 16 + c] = v;
-            expected[r * 16 + c] = uint8_t(requant_ref(v, scales[c]));
-        }
-    }
+    std::vector<float> dst_f((size_t)cols * rows);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c)
+            dst_f[size_t(c) * rows + r] = src_f[size_t(r) * cols + c];
 
-    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
-    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, size_t(SCALE_OFF) * 16, pack_u16_le(scales));
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, pack_fp16(src_f));
+    int length_units = (rows * cols * 2) / 16;
+    int src_rows_field = rows / 16;
     s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::REQUANT_PC(BUF_ACCUM_ID, 0, BUF_WBUF_ID, SCALE_OFF, BUF_ABUF_ID, DST_OFF, 0),
+        insn::BUF_COPY(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0,
+                       length_units, src_rows_field, 1),
         insn::HALT(),
     });
-    s.run(100000);
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(DST_OFF) * 16, expected.size());
-    if (got != expected) TEST_FAIL(name, "REQUANT_PC mismatch");
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, 0, dst_f.size() * 2);
+    expect_bytes_equal(name, got, pack_fp16(dst_f));
     TEST_PASS(name);
 }
 
-static void test_scale_mul_int8_roundtrip() {
-    const char* name = "scale_mul_int8_roundtrip";
-    SimHarness s;
-    constexpr int DST_OFF = 640;
-    constexpr uint16_t SCALE = 0xB800;  // -0.5
-    std::vector<uint8_t> src(16 * 16);
-    std::vector<uint8_t> expected(16 * 16);
-    for (int i = 0; i < 256; ++i) {
-        int8_t v = int8_t(((i * 9) % 61) - 30);
-        src[i] = uint8_t(v);
-        expected[i] = uint8_t(scale_mul_i8_ref(v, SCALE));
-    }
+// ───── VADD ──────────────────────────────────────────────────────────────
 
-    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src);
+void test_vadd_fp16_abuf() {
+    const char* name = "vadd_fp16_abuf";
+    SimHarness s;
+    constexpr int M = 16, N = 16;
+    std::mt19937 rng(303);
+    std::uniform_real_distribution<float> ud(-3.0f, 3.0f);
+    std::vector<float> a((size_t)M * N), b((size_t)M * N), expected((size_t)M * N);
+    for (auto& v : a) v = fp16_snap(ud(rng));
+    for (auto& v : b) v = fp16_snap(ud(rng));
+    for (size_t i = 0; i < a.size(); ++i) expected[i] = a[i] + b[i];
+
+    int rows_units = (M * N * 2) / 16;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, pack_fp16(a));
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 0, pack_fp16(b));
+
+    int out_off = rows_units;
     s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::SET_SCALE(2, SCALE),
-        insn::SCALE_MUL(BUF_ABUF_ID, 0, BUF_WBUF_ID, DST_OFF, 2),
+        insn::CONFIG_TILE(M / 16, N / 16, 1),
+        insn::VADD(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, BUF_ABUF_ID, out_off, 0),
         insn::HALT(),
     });
-    s.run(100000);
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(DST_OFF) * 16, expected.size());
-    if (got != expected) TEST_FAIL(name, "SCALE_MUL INT8 mismatch");
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(out_off) * 16, size_t(rows_units) * 16);
+    expect_bytes_equal(name, got, pack_fp16(expected));
     TEST_PASS(name);
 }
 
-static void test_scale_mul_accum_roundtrip() {
-    const char* name = "scale_mul_accum_roundtrip";
+void test_vadd_accum_bias_broadcast() {
+    const char* name = "vadd_accum_bias_broadcast";
     SimHarness s;
-    constexpr int DST_OFF = 256;
-    constexpr uint16_t SCALE = 0x4200;  // 3.0
-    std::vector<int32_t> src(16 * 16);
-    std::vector<int32_t> expected(16 * 16);
-    for (int i = 0; i < 256; ++i) {
-        src[i] = (i % 13 == 0) ? (INT32_MAX / 2) :
-                 (i % 17 == 0) ? (INT32_MIN / 2) :
-                 int32_t(i * 1234 - 150000);
-        expected[i] = scale_mul_i32_ref(src[i], SCALE);
-    }
+    constexpr int M = 16, N = 16;
+    std::mt19937 rng(404);
+    std::uniform_real_distribution<float> ud_acc(-5.0f, 5.0f);
+    std::uniform_real_distribution<float> ud_bias(-1.0f, 1.0f);
+    std::vector<float> accum((size_t)M * N), bias((size_t)N), expected((size_t)M * N);
+    for (auto& v : accum) v = ud_acc(rng);
+    for (auto& v : bias) v = fp16_snap(ud_bias(rng));
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            expected[size_t(r) * N + c] = accum[size_t(r) * N + c] + bias[size_t(c)];
 
-    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
+    int accum_rows = (M * N * 4) / 16;
+    int bias_rows  = (N * 2) / 16;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_fp32(accum));
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 0, pack_fp16(bias));
+
+    int out_off = 256;
     s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::SET_SCALE(3, SCALE),
-        insn::SCALE_MUL(BUF_ACCUM_ID, 0, BUF_ACCUM_ID, DST_OFF, 3),
+        insn::CONFIG_TILE(M / 16, N / 16, 1),
+        insn::VADD(BUF_ACCUM_ID, 0, BUF_WBUF_ID, 0, BUF_ACCUM_ID, out_off, 0),
         insn::HALT(),
     });
-    s.run(100000);
-
-    auto got = unpack_i32_le(sram_read_bytes(s.dut.get(), BUF_ACCUM_ID, size_t(DST_OFF) * 16, 16 * 16 * 4ULL));
-    if (got != expected) TEST_FAIL(name, "SCALE_MUL ACCUM mismatch");
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_ACCUM_ID,
+                               size_t(out_off) * 16, size_t(accum_rows) * 16);
+    (void)bias_rows;
+    expect_bytes_equal(name, got, pack_fp32(expected));
     TEST_PASS(name);
 }
 
-static void test_dequant_add_roundtrip() {
-    const char* name = "dequant_add_roundtrip";
+void test_vadd_attention_mask_fp16() {
+    const char* name = "vadd_attention_mask_fp16";
     SimHarness s;
-    constexpr int DST_OFF = 768;
-    constexpr uint16_t ACC_SCALE = 0x2C00;   // 0.0625
-    constexpr uint16_t SKIP_SCALE = 0x3400;  // 0.25
-    std::vector<int32_t> accum(16 * 16);
-    std::vector<uint8_t> skip(16 * 16);
-    std::vector<uint8_t> expected(16 * 16);
+    constexpr int M = 16, N = 16;
+    std::vector<float> accum((size_t)M * N, 0.0f);
+    std::vector<float> mask((size_t)N, 0.0f);
+    for (int c = N / 2; c < N; ++c) mask[size_t(c)] = -65504.0f;
 
-    for (int i = 0; i < 256; ++i) {
-        accum[i] = (i - 120) * 11;
-        int8_t skip_i8 = int8_t(((i * 5) % 29) - 14);
-        skip[i] = uint8_t(skip_i8);
-        expected[i] = uint8_t(dequant_add_ref(accum[i], skip_i8, ACC_SCALE, SKIP_SCALE));
-    }
+    std::vector<float> expected((size_t)M * N);
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            expected[size_t(r) * N + c] = accum[size_t(r) * N + c] + mask[size_t(c)];
 
-    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(accum));
-    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, skip);
+    int accum_rows = (M * N * 4) / 16;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_fp32(accum));
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 0, pack_fp16(mask));
+
+    int out_off = 384;
     s.load({
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::SET_SCALE(4, ACC_SCALE),
-        insn::SET_SCALE(5, SKIP_SCALE),
-        insn::DEQUANT_ADD(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, DST_OFF, 4),
+        insn::CONFIG_TILE(M / 16, N / 16, 1),
+        insn::VADD(BUF_ACCUM_ID, 0, BUF_WBUF_ID, 0, BUF_ACCUM_ID, out_off, 0),
         insn::HALT(),
     });
-    s.run(100000);
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(DST_OFF) * 16, expected.size());
-    if (got != expected) TEST_FAIL(name, "DEQUANT_ADD mismatch");
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_ACCUM_ID,
+                               size_t(out_off) * 16, size_t(accum_rows) * 16);
+    expect_bytes_equal(name, got, pack_fp32(expected));
     TEST_PASS(name);
 }
 
-static void test_helper_oob_faults() {
-    expect_fault_program("helper_buf_copy_oob_fault",
-                         { insn::BUF_COPY(BUF_ABUF_ID, 8191, BUF_WBUF_ID, 0, 2, 0, 0) }, 3, 5000);
-    expect_fault_program("helper_vadd_bad_mode_fault",
-                         { insn::CONFIG_TILE(1, 1, 1),
-                           insn::VADD(BUF_WBUF_ID, 0, BUF_WBUF_ID, 0, BUF_ABUF_ID, 0, 0) }, 6, 5000);
-    expect_fault_program("helper_requant_bad_mode_fault",
-                         { insn::CONFIG_TILE(1, 1, 1),
-                           insn::REQUANT(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 0) }, 6, 5000);
-    expect_fault_program("helper_dequant_add_bad_sreg_fault",
-                         { insn::CONFIG_TILE(1, 1, 1),
-                           insn::DEQUANT_ADD(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 15) }, 6, 5000);
-}
+// ───── SCALE_MUL ─────────────────────────────────────────────────────────
 
-static void test_matmul_then_requant() {
-    const char* name = "matmul_then_requant";
+void test_scale_mul_abuf_fp16() {
+    const char* name = "scale_mul_abuf_fp16";
     SimHarness s;
-    int8_t a[16][16] = {};
-    int8_t eye[16][16] = {};
-    int32_t exp_acc[16][16] = {};
-    std::vector<uint8_t> expected(256);
-    std::vector<uint64_t> prog;
-    constexpr uint64_t src_a_addr = 0x280000ULL;
-    constexpr uint64_t src_b_addr = 0x281000ULL;
+    constexpr int M = 16, N = 16;
+    const float scale_f = -0.5f;
+    const uint16_t scale_bits = fp32_to_fp16(scale_f);
+    std::mt19937 rng(505);
+    std::uniform_real_distribution<float> ud(-2.0f, 2.0f);
+    std::vector<float> x((size_t)M * N), expected((size_t)M * N);
+    for (auto& v : x) v = fp16_snap(ud(rng));
+    const float scale = fp16_to_fp32(scale_bits);
+    for (size_t i = 0; i < x.size(); ++i) expected[i] = x[i] * scale;
 
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            a[i][j] = int8_t((i * 5 + j) - 20);
-            eye[i][j] = (i == j) ? 1 : 0;
-        }
-    }
-    matmul_ref(a, eye, exp_acc);
-    for (int i = 0; i < 16; ++i)
-        for (int j = 0; j < 16; ++j)
-            expected[i * 16 + j] = uint8_t(requant_ref(exp_acc[i][j], 0x3C00));
+    int rows_units = (M * N * 2) / 16;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, pack_fp16(x));
 
-    systolic_test::prepare_logical_16x16(s.dram, prog, a, eye, src_a_addr, src_b_addr, 128, 0);
-    prog.insert(prog.end(), {
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::MATMUL(BUF_ABUF_ID, 128, BUF_WBUF_ID, 0, BUF_ACCUM_ID, 0, 0),
-        insn::SYNC(0b010),
-        insn::SET_SCALE(0, 0x3C00),
-        insn::REQUANT(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 256, 0),
+    int out_off = 128;
+    s.load({
+        insn::CONFIG_TILE(M / 16, N / 16, 1),
+        insn::SET_SCALE(2, scale_bits, 0),
+        insn::SCALE_MUL(BUF_ABUF_ID, 0, BUF_ABUF_ID, out_off, 2, 0),
         insn::HALT(),
     });
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(out_off) * 16, size_t(rows_units) * 16);
+    expect_bytes_equal(name, got, pack_fp16(expected));
+    TEST_PASS(name);
+}
+
+void test_scale_mul_accum_fp32() {
+    const char* name = "scale_mul_accum_fp32";
+    SimHarness s;
+    constexpr int M = 16, N = 16;
+    const float scale_f = 3.0f;
+    const uint16_t scale_bits = fp32_to_fp16(scale_f);
+    std::mt19937 rng(606);
+    std::uniform_real_distribution<float> ud(-10.0f, 10.0f);
+    std::vector<float> x((size_t)M * N), expected((size_t)M * N);
+    for (auto& v : x) v = ud(rng);
+    const float scale = fp16_to_fp32(scale_bits);
+    for (size_t i = 0; i < x.size(); ++i) expected[i] = x[i] * scale;
+
+    int rows_units = (M * N * 4) / 16;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_fp32(x));
+
+    int out_off = 256;
+    s.load({
+        insn::CONFIG_TILE(M / 16, N / 16, 1),
+        insn::SET_SCALE(3, scale_bits, 0),
+        insn::SCALE_MUL(BUF_ACCUM_ID, 0, BUF_ACCUM_ID, out_off, 3, 0),
+        insn::HALT(),
+    });
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_ACCUM_ID,
+                               size_t(out_off) * 16, size_t(rows_units) * 16);
+    expect_bytes_equal(name, got, pack_fp32(expected));
+    TEST_PASS(name);
+}
+
+void test_scale_mul_accum_to_abuf_narrow() {
+    const char* name = "scale_mul_accum_to_abuf_narrow";
+    SimHarness s;
+    constexpr int M = 16, N = 16;
+    const uint16_t scale_one = fp32_to_fp16(1.0f);
+    std::mt19937 rng(707);
+    std::uniform_real_distribution<float> ud(-100.0f, 100.0f);
+    std::vector<float> x((size_t)M * N), expected((size_t)M * N);
+    for (auto& v : x) v = ud(rng);
+    for (size_t i = 0; i < x.size(); ++i) expected[i] = x[i];
+
+    int accum_rows = (M * N * 4) / 16;
+    int abuf_rows  = (M * N * 2) / 16;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_fp32(x));
+
+    int out_off = 320;
+    s.load({
+        insn::CONFIG_TILE(M / 16, N / 16, 1),
+        insn::SET_SCALE(4, scale_one, 0),
+        insn::SCALE_MUL(BUF_ACCUM_ID, 0, BUF_ABUF_ID, out_off, 4, 0),
+        insn::HALT(),
+    });
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    (void)accum_rows;
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(out_off) * 16, size_t(abuf_rows) * 16);
+    expect_bytes_equal(name, got, pack_fp16(expected));
+    TEST_PASS(name);
+}
+
+void test_scale_mul_accum_to_abuf_nonunit() {
+    const char* name = "scale_mul_accum_to_abuf_nonunit";
+    SimHarness s;
+    constexpr int M = 16, N = 16;
+    const uint16_t scale_bits = fp32_to_fp16(0.25f);
+    const float scale = fp16_to_fp32(scale_bits);
+    std::mt19937 rng(808);
+    std::uniform_real_distribution<float> ud(-50.0f, 50.0f);
+    std::vector<float> x((size_t)M * N), expected((size_t)M * N);
+    for (auto& v : x) v = ud(rng);
+    for (size_t i = 0; i < x.size(); ++i) expected[i] = x[i] * scale;
+
+    int abuf_rows = (M * N * 2) / 16;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_fp32(x));
+
+    int out_off = 448;
+    s.load({
+        insn::CONFIG_TILE(M / 16, N / 16, 1),
+        insn::SET_SCALE(5, scale_bits, 0),
+        insn::SCALE_MUL(BUF_ACCUM_ID, 0, BUF_ABUF_ID, out_off, 5, 0),
+        insn::HALT(),
+    });
+    s.run(300000);
+    expect_clean_halt(name, s.dut.get());
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(out_off) * 16, size_t(abuf_rows) * 16);
+    expect_bytes_equal(name, got, pack_fp16(expected));
+    TEST_PASS(name);
+}
+
+// ───── Dropped opcodes raise FAULT_UNSUPPORTED_OP ────────────────────────
+
+void expect_fault_program(const char* name, const std::vector<uint64_t>& prog,
+                          uint32_t expected_fault_code, int timeout = 5000) {
+    SimHarness s;
     s.load(prog);
-    s.run(200000);
-
-    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 256 * 16, expected.size());
-    if (got != expected) TEST_FAIL(name, "matmul->requant mismatch");
+    s.run(timeout);
+    if (s.dut->fault != 1) TEST_FAIL(name, "fault did not assert");
+    if (s.dut->done == 1) TEST_FAIL(name, "done should remain low under fault");
+    if (s.dut->fault_code != expected_fault_code)
+        TEST_FAIL(name, "unexpected fault code");
     TEST_PASS(name);
 }
 
-static void test_transpose_then_matmul() {
-    const char* name = "transpose_then_matmul";
-    SimHarness s;
-    int8_t a[16][16] = {};
-    int8_t k[16][16] = {};
-    int8_t kt[16][16] = {};
-    int32_t exp[16][16] = {};
-    std::vector<uint64_t> prog;
-    constexpr uint64_t src_a_addr = 0x282000ULL;
-    constexpr uint64_t src_k_addr = 0x283000ULL;
-
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            a[i][j] = int8_t(((i * 3 + j * 5) % 11) - 5);
-            k[i][j] = int8_t(((i * 7 + j * 2 + 1) % 13) - 6);
-            kt[j][i] = k[i][j];
-        }
-    }
-
-    s.dram.write_bytes(src_k_addr, systolic_test::flatten_16x16(k).data(), 256);
-    systolic_test::append_load_sync(prog, 0, src_k_addr, BUF_ABUF_ID, 0, 16);
-    systolic_test::append_prepare_a_tile(prog, 1, src_a_addr, 128);
-    matmul_ref(a, kt, exp);
-
-    s.dram.write_bytes(src_a_addr, systolic_test::flatten_16x16(a).data(), 256);
-    prog.insert(prog.end(), {
-        insn::BUF_COPY(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 16, 1, 1),
-        insn::CONFIG_TILE(1, 1, 1),
-        insn::MATMUL(BUF_ABUF_ID, 128, BUF_WBUF_ID, 0, BUF_ACCUM_ID, 0, 0),
-        insn::SYNC(0b010),
-        insn::HALT(),
-    });
-    s.load(prog);
-    s.run(200000);
-
-    for (int i = 0; i < 16; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            int32_t got = read_accum_ij(s.dut.get(), 0, i, j);
-            if (got != exp[i][j]) {
-                fprintf(stderr, "transpose->matmul mismatch i=%d j=%d got=%d exp=%d\n",
-                        i, j, got, exp[i][j]);
-                TEST_FAIL(name, "transpose-fed MATMUL mismatch");
-            }
-        }
-    }
-    TEST_PASS(name);
+void test_requant_unsupported() {
+    expect_fault_program("requant_unsupported",
+        { insn::CONFIG_TILE(1, 1, 1),
+          insn::SET_SCALE(0, 0x3C00, 0),
+          insn::REQUANT(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, 0, 0),
+          insn::HALT() }, 0x6, 5000);
 }
+
+void test_requant_pc_unsupported() {
+    expect_fault_program("requant_pc_unsupported",
+        { insn::CONFIG_TILE(1, 1, 1),
+          insn::REQUANT_PC(BUF_ACCUM_ID, 0, BUF_WBUF_ID, 0, BUF_ABUF_ID, 0, 0, 0),
+          insn::HALT() }, 0x6, 5000);
+}
+
+void test_dequant_add_unsupported() {
+    expect_fault_program("dequant_add_unsupported",
+        { insn::CONFIG_TILE(1, 1, 1),
+          insn::SET_SCALE(0, 0x3C00, 0),
+          insn::SET_SCALE(1, 0x3C00, 0),
+          insn::DEQUANT_ADD(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 0, 0),
+          insn::HALT() }, 0x6, 5000);
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
-
+    printf("--- W8A16 helper engine verilator tests ---\n");
     test_buf_copy_flat_interbuffer();
     test_buf_copy_overlap_compaction();
-    test_buf_copy_zero_length();
-    test_buf_copy_transpose_unaligned_source();
-    test_buf_copy_transpose_same_buffer_fault();
-    test_vadd_int8_saturating();
-    test_vadd_bias_int32_wrap();
-    test_requant_rounding_and_clipping();
-    test_requant_subnormal_negative_zero();
-    test_requant_pc_per_column();
-    test_scale_mul_int8_roundtrip();
-    test_scale_mul_accum_roundtrip();
-    test_dequant_add_roundtrip();
-    test_helper_oob_faults();
-    test_matmul_then_requant();
-    test_transpose_then_matmul();
-
+    test_buf_copy_transpose_fp16_square();
+    test_buf_copy_transpose_fp16_rect();
+    test_vadd_fp16_abuf();
+    test_vadd_accum_bias_broadcast();
+    test_vadd_attention_mask_fp16();
+    test_scale_mul_abuf_fp16();
+    test_scale_mul_accum_fp32();
+    test_scale_mul_accum_to_abuf_narrow();
+    test_scale_mul_accum_to_abuf_nonunit();
+    test_requant_unsupported();
+    test_requant_pc_unsupported();
+    test_dequant_add_unsupported();
     printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     if (tests_pass != tests_run) std::exit(1);
     return 0;

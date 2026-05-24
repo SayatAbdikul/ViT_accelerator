@@ -1,23 +1,31 @@
-// Blocking helper engine for Phase C baseline helper instructions.
+// Blocking helper engine for the W8A16 datapath.
 //
-// Supported operations:
-//   - BUF_COPY     : flat copy + distinct-buffer transpose
-//   - VADD         : INT8 saturating add and ACCUM+WBUF bias add
-//   - REQUANT      : ACCUM INT32 -> ABUF/WBUF INT8 via exact FP16 scale
-//   - REQUANT_PC   : ACCUM INT32 -> ABUF/WBUF INT8 via per-column FP16 scales
-//   - SCALE_MUL    : width-preserving tile-scale multiply for INT8 / INT32
-//   - DEQUANT_ADD  : ACCUM + INT8 skip path fused back to INT8
+// Supported operations (W8A16 contract):
+//   - BUF_COPY  : flat byte copy / FP16-element-aware transpose
+//   - VADD      : FP16 + FP16 -> FP16 (ABUF) or FP32 + FP16-broadcast -> FP32
+//                 (ACCUM bias / attention-mask add)
+//   - SCALE_MUL : FP16 widen / FP32 in -> FP32 mul -> FP16 narrow (ABUF dst)
+//                 or stay FP32 (ACCUM dst)
 //
-// The helper engine is architecturally blocking. Control dispatches it through
-// helper_dispatch and waits in S_DISP_WAIT until helper_busy drops.
+// Removed in W8A16 (was W8A8):
+//   - REQUANT (0x0B), REQUANT_PC (0x11), DEQUANT_ADD (0x13). These remain
+//     legal ISA encodings but are unsupported here; dispatching them raises
+//     FAULT_UNSUPPORTED_OP. Phase 5 hoists the rejection into decode_unit;
+//     until then this engine catches the dispatch.
+//
+// Datapath:
+//   - ABUF rows hold 8 FP16 elements per 128-bit row (was 16 INT8).
+//   - ACCUM rows hold 4 FP32 elements per 128-bit row (same 4x32-bit slots
+//     as INT32; bit interpretation flipped to FP32).
+//   - Geometry: fp16 row count = m_rows * n_tiles * 2  (= n_fp16_chunks),
+//     fp32 row count = m_rows * n_tiles * 4  (= n_chunks_i32, unchanged).
+//
+// The helper engine is architecturally blocking. Control dispatches it
+// through helper_dispatch and waits in S_DISP_WAIT until helper_busy drops.
 //
 // It owns both SRAM ports while active:
 //   - port A for reads and writes
 //   - port B for a second read stream when an operation needs two sources
-//
-// The implementation is intentionally microcoded as a small FSM rather than
-// deeply pipelined. Phase C prioritizes correctness and clear SRAM sequencing
-// over maximum overlap.
 
 `ifndef BLOCKING_HELPER_ENGINE_SV
 `define BLOCKING_HELPER_ENGINE_SV
@@ -46,7 +54,9 @@ module blocking_helper_engine
   input  logic [9:0]   tile_m,
   input  logic [9:0]   tile_n,
   input  logic [15:0]  scale0_data,
+  /* verilator lint_off UNUSED */
   input  logic [15:0]  scale1_data,
+  /* verilator lint_on UNUSED */
 
   output logic         helper_busy,
   output logic         helper_fault,
@@ -68,109 +78,91 @@ module blocking_helper_engine
 );
 
   // State groups:
-  //   H_FLAT_*   : BUF_COPY flat copy / memmove
-  //   H_TSRC_*   : BUF_COPY transpose source gather
-  //   H_TDST_*   : BUF_COPY transpose destination update
-  //   H_V8_*     : INT8 residual VADD
-  //   H_VB_*     : load and reuse one INT32 bias row chunk
-  //   H_VACC_*   : INT32 ACCUM bias add
-  //   H_RQ_*       : REQUANT four ACCUM rows into one INT8 row
-  //   H_SM_*       : SCALE_MUL row-wise read / write
-  //   H_RQPC_*     : REQUANT_PC scale-table load + ACCUM gather + write
-  //   H_DQ_*       : DEQUANT_ADD skip read + ACCUM gather + write
-  typedef enum logic [5:0] {
-    H_IDLE            = 6'd0,
-    H_FLAT_READ       = 6'd1,
-    H_FLAT_WRITE      = 6'd2,
-    H_TSRC_REQ1       = 6'd3,
-    H_TSRC_CAP1       = 6'd4,
-    H_TSRC_REQ2       = 6'd5,
-    H_TSRC_CAP2       = 6'd6,
-    H_TDST_REQ        = 6'd7,
-    H_TDST_WRITE      = 6'd8,
-    H_V8_READ         = 6'd9,
-    H_V8_WRITE        = 6'd10,
-    H_VB_REQ          = 6'd11,
-    H_VB_LATCH        = 6'd12,
-    H_VACC_READ       = 6'd13,
-    H_VACC_WRITE      = 6'd14,
-    H_RQ_REQ          = 6'd15,
-    H_RQ_LATCH        = 6'd16,
-    H_RQ_WRITE        = 6'd17,
-    H_SM_REQ          = 6'd18,
-    H_SM_WRITE        = 6'd19,
-    H_RQPC_SCALE0_REQ = 6'd20,
-    H_RQPC_SCALE0_LATCH = 6'd21,
-    H_RQPC_SCALE1_REQ = 6'd22,
-    H_RQPC_SCALE1_LATCH = 6'd23,
-    H_RQPC_REQ        = 6'd24,
-    H_RQPC_LATCH      = 6'd25,
-    H_RQPC_WRITE      = 6'd26,
-    H_DQ_SKIP_REQ     = 6'd27,
-    H_DQ_SKIP_LATCH   = 6'd28,
-    H_DQ_REQ          = 6'd29,
-    H_DQ_LATCH        = 6'd30,
-    H_DQ_WRITE        = 6'd31,
-    H_FAULT           = 6'd32
+  //   H_FLAT_*  : BUF_COPY flat copy / memmove (byte-oriented)
+  //   H_TSRC_*  : BUF_COPY transpose source gather (FP16-element tile)
+  //   H_TDST_*  : BUF_COPY transpose destination scatter
+  //   H_V16_*   : FP16 ABUF VADD (FP16 + FP16 -> FP16)
+  //   H_VB_*    : ACCUM VADD bias-row load (one FP16 row, reused across M)
+  //   H_VACC_*  : ACCUM VADD FP32 + FP16-widened-broadcast -> FP32
+  //   H_SM1_*   : SCALE_MUL one-read-one-write (ABUF->ABUF or ACCUM->ACCUM)
+  //   H_SM2_*   : SCALE_MUL two-reads-one-write (ACCUM->ABUF narrowing)
+  typedef enum logic [4:0] {
+    H_IDLE        = 5'd0,
+    H_FLAT_READ   = 5'd1,
+    H_FLAT_WRITE  = 5'd2,
+    H_TSRC_REQ    = 5'd3,
+    H_TSRC_LATCH  = 5'd4,
+    H_TDST_WRITE  = 5'd5,
+    H_V16_READ    = 5'd6,
+    H_V16_WRITE   = 5'd7,
+    H_VB_REQ      = 5'd8,
+    H_VB_LATCH    = 5'd9,
+    H_VACC_READ   = 5'd10,
+    H_VACC_WRITE  = 5'd11,
+    H_SM1_REQ     = 5'd12,
+    H_SM1_WRITE   = 5'd13,
+    H_SM2_REQ     = 5'd14,
+    H_SM2_LATCH   = 5'd15,
+    H_SM2_WRITE   = 5'd16,
+    H_FAULT       = 5'd17
   } helper_state_t;
 
   helper_state_t state;
 
-  // Latched instruction parameters and loop counters.
+  // Latched instruction parameters.
   logic [4:0]   opcode_q;
   logic [1:0]   src1_buf_q, src2_buf_q, dst_buf_q;
   logic [15:0]  src1_off_q, src2_off_q, dst_off_q;
+  /* verilator lint_off UNUSED */
   logic [3:0]   sreg_q;
+  /* verilator lint_on UNUSED */
   logic [15:0]  b_length_q;
   logic [5:0]   b_src_rows_q;
+  /* verilator lint_off UNUSED */
   logic         b_transpose_q;
-  logic [15:0]  scale0_q, scale1_q;
+  /* verilator lint_on UNUSED */
   logic [14:0]  m_rows_q;
   logic [10:0]  n_tiles_q;
+  logic [11:0]  n_fp16_chunks_q;
   logic [12:0]  n_chunks_i32_q;
   logic [3:0]   fault_code_r;
 
+  // FP16 scale latched as FP32 once at dispatch — SCALE_MUL stays FP32-internal.
+  fp32_t        scale_fp32_q;
+
+  // Flat-copy / V16 step counter.
   logic [31:0]  step_idx_q;
   logic         flat_backward_q;
 
+  // Transpose state. Inner tile is 8x8 FP16 elements (one 128-bit SRAM row
+  // per tile row), so dimensions index FP16 elements, not bytes.
   logic [15:0]  trans_row_count_q;
   logic [15:0]  trans_cols_q;
   logic [15:0]  trans_rbase_q;
   logic [15:0]  trans_cbase_q;
-  logic [4:0]   trans_height_q;
-  logic [4:0]   trans_width_q;
-  logic [4:0]   trans_src_row_idx_q;
-  logic [4:0]   trans_dst_row_idx_q;
-  logic [127:0] trans_first_row_q;
-  logic [127:0] trans_scratch_q [0:15];
+  logic [3:0]   trans_height_q;
+  logic [3:0]   trans_width_q;
+  logic [3:0]   trans_src_row_idx_q;
+  logic [3:0]   trans_dst_row_idx_q;
+  logic [127:0] trans_scratch_q [0:7];
 
-  logic [15:0]  bias_chunk_q;
+  // ACCUM bias / VACC scheduling state.
+  // bias_chunk_q counts in FP16-row units (each = 8 columns).
+  // c4_half_q selects which 4-column half of the FP16 bias row maps to the
+  // current ACCUM 4-column chunk: c4 = 2*bias_chunk_q + c4_half_q.
+  logic [11:0]  bias_chunk_q;
+  logic         c4_half_q;
   logic [14:0]  bias_row_idx_q;
   logic [127:0] bias_data_q;
 
-  logic [14:0]  rq_row_idx_q;
-  logic [10:0]  rq_col_chunk_q;
-  logic [1:0]   rq_part_q;
-  logic [127:0] rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q;
-  logic [127:0] skip_row_q;
-  logic [15:0]  pc_scale_chunk_q [0:15];
+  // SCALE_MUL ACCUM->ABUF two-row latch (mirror of SFU GELU FP32->FP16).
+  // Both rows must be registered because sram_b_rdata is only valid in the
+  // cycle immediately following its read request.
+  logic         sm_part_q;
+  logic [127:0] sm_row0_q;
+  logic [127:0] sm_row1_q;
 
-  // buf_rows() lives in taccel_pkg; imported via `import taccel_pkg::*`.
-
-  function automatic logic [4:0] block_span(
-    input logic [15:0] total,
-    input logic [15:0] base
-  );
-    logic [15:0] rem;
-    begin
-      rem = total - base;
-      if (rem > 16)
-        block_span = 5'd16;
-      else
-        block_span = rem[4:0];
-    end
-  endfunction
-
+  // Element accessors.
   function automatic logic [7:0] get_byte(
     input logic [127:0] row,
     input integer       idx
@@ -189,366 +181,90 @@ module blocking_helper_engine
     end
   endfunction
 
-  // Saturating INT8 lane-wise add for residual connections.
-  function automatic logic [127:0] sat_add_int8_row(
-    input logic [127:0] a_row,
-    input logic [127:0] b_row
-  );
-    logic signed [8:0] sum;
-    logic signed [7:0] a_i8, b_i8;
-    logic [127:0] out_row;
-    integer i;
-    begin
-      out_row = 128'h0;
-      for (i = 0; i < 16; i++) begin
-        a_i8 = a_row[(i * 8) +: 8];
-        b_i8 = b_row[(i * 8) +: 8];
-        sum  = $signed(a_i8) + $signed(b_i8);
-        if (sum > 9'sd127)
-          out_row[(i * 8) +: 8] = 8'h7F;
-        else if (sum < -9'sd128)
-          out_row[(i * 8) +: 8] = 8'h80;
-        else
-          out_row[(i * 8) +: 8] = sum[7:0];
-      end
-      sat_add_int8_row = out_row;
-    end
-  endfunction
-
-  // Wraparound INT32 lane-wise add to match numpy int32 bias-add behavior.
-  function automatic logic [127:0] add_wrap_int32_row(
-    input logic [127:0] a_row,
-    input logic [127:0] b_row
-  );
-    logic signed [31:0] a_i32, b_i32, sum_i32;
-    logic [127:0] out_row;
-    integer i;
-    begin
-      out_row = 128'h0;
-      for (i = 0; i < 4; i++) begin
-        a_i32 = a_row[(i * 32) +: 32];
-        b_i32 = b_row[(i * 32) +: 32];
-        sum_i32 = $signed(a_i32) + $signed(b_i32);
-        out_row[(i * 32) +: 32] = sum_i32;
-      end
-      add_wrap_int32_row = out_row;
-    end
-  endfunction
-
-  // Exact INT32 x FP16 scaling with round-half-to-even on right shifts.
-  // This is written as a reusable scalar primitive for later helper/SFU work.
-  function automatic logic signed [63:0] fp16_mul_round_even(
-    input logic signed [31:0] src_val,
-    input logic [15:0]        fp16_val
-  );
-    logic        sign_h;
-    logic [4:0]  exp_h;
-    logic [9:0]  frac_h;
-    logic signed [12:0] mant;
-    integer      shift_amt;
-    logic signed [63:0] prod;
-    logic signed [63:0] abs_prod;
-    logic signed [63:0] quot;
-    logic signed [63:0] rem;
-    logic signed [63:0] half;
-    begin
-      sign_h = fp16_val[15];
-      exp_h  = fp16_val[14:10];
-      frac_h = fp16_val[9:0];
-
-      if ((exp_h == 5'h0) && (frac_h == 10'h0)) begin
-        fp16_mul_round_even = 64'sd0;
-      end else begin
-        if (exp_h == 5'h0) begin
-          mant      = $signed({3'b000, frac_h});
-          shift_amt = -24;
-        end else begin
-          mant      = $signed({2'b00, 1'b1, frac_h});
-          shift_amt = integer'(exp_h) - 25;
-        end
-
-        prod = $signed(src_val) * $signed(mant);
-        if (sign_h)
-          prod = -prod;
-
-        if (shift_amt >= 0) begin
-          fp16_mul_round_even = prod <<< shift_amt;
-        end else begin
-          abs_prod = (prod < 0) ? -prod : prod;
-          quot     = abs_prod >>> (-shift_amt);
-          rem      = abs_prod & ((64'sd1 <<< (-shift_amt)) - 64'sd1);
-          half     = 64'sd1 <<< ((-shift_amt) - 1);
-          if ((rem > half) || ((rem == half) && quot[0]))
-            quot = quot + 64'sd1;
-          fp16_mul_round_even = (prod < 0) ? -quot : quot;
-        end
-      end
-    end
-  endfunction
-
-  // pow2_int / fp16_to_real / round_half_even helpers were removed for
-  // synthesis; the equivalent logic lives in fp32_prim_pkg
-  // (fp32_from_fp16_bits, fp32_from_i8/i32, fp32_quantize_i8_bits).
-
-  function automatic logic [127:0] scale_mul_i8_row(
+  function automatic logic [31:0] get_u32(
     input logic [127:0] row,
-    input logic [15:0]  scale_val
+    input integer       idx
   );
-    logic signed [7:0] src_i8;
-    logic signed [63:0] scaled;
-    logic [127:0] out_row;
-    integer i;
     begin
-      out_row = 128'h0;
-      for (i = 0; i < 16; i++) begin
-        src_i8 = row[(i * 8) +: 8];
-        scaled = fp16_mul_round_even({{24{src_i8[7]}}, src_i8}, scale_val);
-        if (scaled > 64'sd127)
-          out_row[(i * 8) +: 8] = 8'h7F;
-        else if (scaled < -64'sd128)
-          out_row[(i * 8) +: 8] = 8'h80;
-        else
-          out_row[(i * 8) +: 8] = scaled[7:0];
-      end
-      scale_mul_i8_row = out_row;
+      get_u32 = row[(idx * 32) +: 32];
     end
   endfunction
 
-  function automatic logic [127:0] scale_mul_i32_row(
-    input logic [127:0] row,
-    input logic [15:0]  scale_val
-  );
-    logic signed [31:0] src_i32;
-    logic signed [63:0] scaled;
-    logic [127:0] out_row;
-    integer i;
-    begin
-      out_row = 128'h0;
-      for (i = 0; i < 4; i++) begin
-        src_i32 = row[(i * 32) +: 32];
-        scaled = fp16_mul_round_even(src_i32, scale_val);
-        if (scaled > 64'sd2147483647)
-          out_row[(i * 32) +: 32] = 32'h7FFF_FFFF;
-        else if (scaled < -64'sd2147483648)
-          out_row[(i * 32) +: 32] = 32'h8000_0000;
-        else
-          out_row[(i * 32) +: 32] = scaled[31:0];
-      end
-      scale_mul_i32_row = out_row;
-    end
-  endfunction
-
-  function automatic logic [127:0] dequant_add_pack(
-    input logic [127:0] row0,
-    input logic [127:0] row1,
-    input logic [127:0] row2,
-    input logic [127:0] row3,
-    input logic [127:0] skip_row,
-    input logic [15:0]  scale0_val,
-    input logic [15:0]  scale1_val
-  );
-    logic signed [31:0] src_i32;
-    logic signed [7:0]  skip_i8;
-    logic [127:0]       out_row;
-    fp32_t              accum_scale_b;
-    fp32_t              skip_scale_b;
-    fp32_t              sum_b;
-    s64_t               q;
-    integer             idx;
-    begin
-      accum_scale_b = fp32_from_fp16_bits(scale0_val);
-      skip_scale_b  = fp32_from_fp16_bits(scale1_val);
-      out_row = 128'h0;
-      for (idx = 0; idx < 16; idx++) begin
-        case (idx[3:2])
-          2'd0: src_i32 = row0[(idx[1:0] * 32) +: 32];
-          2'd1: src_i32 = row1[(idx[1:0] * 32) +: 32];
-          2'd2: src_i32 = row2[(idx[1:0] * 32) +: 32];
-          default: src_i32 = row3[(idx[1:0] * 32) +: 32];
-        endcase
-        skip_i8 = skip_row[(idx * 8) +: 8];
-        sum_b = fp32_add_bits(
-            fp32_mul_bits(fp32_from_i32(src_i32), accum_scale_b),
-            fp32_mul_bits(fp32_from_i8(skip_i8), skip_scale_b)
-        );
-        // quantize with scale=1.0 -> round-half-even + clamp to [-128,127].
-        q = fp32_quantize_i8_bits(sum_b, FP32_ONE);
-        out_row[(idx * 8) +: 8] = q[7:0];
-      end
-      dequant_add_pack = out_row;
-    end
-  endfunction
-
-  // Pack four ACCUM rows (4 x 4 x INT32) into one INT8 destination row.
-  function automatic logic [127:0] requant_pack(
-    input logic [127:0] row0,
-    input logic [127:0] row1,
-    input logic [127:0] row2,
-    input logic [127:0] row3,
-    input logic [15:0]  scale_val
-  );
-    logic signed [31:0] src_i32;
-    logic signed [63:0] scaled;
-    logic [127:0] out_row;
-    integer i;
-    begin
-      out_row = 128'h0;
-      for (i = 0; i < 4; i++) begin
-        src_i32 = row0[(i * 32) +: 32];
-        scaled  = fp16_mul_round_even(src_i32, scale_val);
-        if (scaled > 64'sd127)
-          out_row[(i * 8) +: 8] = 8'h7F;
-        else if (scaled < -64'sd128)
-          out_row[(i * 8) +: 8] = 8'h80;
-        else
-          out_row[(i * 8) +: 8] = scaled[7:0];
-
-        src_i32 = row1[(i * 32) +: 32];
-        scaled  = fp16_mul_round_even(src_i32, scale_val);
-        if (scaled > 64'sd127)
-          out_row[((i + 4) * 8) +: 8] = 8'h7F;
-        else if (scaled < -64'sd128)
-          out_row[((i + 4) * 8) +: 8] = 8'h80;
-        else
-          out_row[((i + 4) * 8) +: 8] = scaled[7:0];
-
-        src_i32 = row2[(i * 32) +: 32];
-        scaled  = fp16_mul_round_even(src_i32, scale_val);
-        if (scaled > 64'sd127)
-          out_row[((i + 8) * 8) +: 8] = 8'h7F;
-        else if (scaled < -64'sd128)
-          out_row[((i + 8) * 8) +: 8] = 8'h80;
-        else
-          out_row[((i + 8) * 8) +: 8] = scaled[7:0];
-
-        src_i32 = row3[(i * 32) +: 32];
-        scaled  = fp16_mul_round_even(src_i32, scale_val);
-        if (scaled > 64'sd127)
-          out_row[((i + 12) * 8) +: 8] = 8'h7F;
-        else if (scaled < -64'sd128)
-          out_row[((i + 12) * 8) +: 8] = 8'h80;
-        else
-          out_row[((i + 12) * 8) +: 8] = scaled[7:0];
-      end
-      requant_pack = out_row;
-    end
-  endfunction
-
-  // Transpose path helper: extract up to 16 contiguous bytes starting at an
-  // arbitrary byte position, spanning two source rows when needed.
-  function automatic logic [127:0] extract_window(
-    input logic [127:0] row0,
-    input logic [127:0] row1,
-    input logic [3:0]   start_byte,
-    input logic [4:0]   width
-  );
-    logic [127:0] out_row;
-    integer i;
-    integer src_idx;
-    begin
-      out_row = 128'h0;
-      for (i = 0; i < 16; i++) begin
-        if (i < integer'(width)) begin
-          src_idx = integer'(start_byte) + i;
-          if (src_idx < 16)
-            out_row[(i * 8) +: 8] = get_byte(row0, src_idx);
-          else
-            out_row[(i * 8) +: 8] = get_byte(row1, src_idx - 16);
-        end
-      end
-      extract_window = out_row;
-    end
-  endfunction
-
-  // Geometry derived from CONFIG_TILE and the dispatched helper instruction.
+  // Dispatch-time geometry.
+  // n_fp16_chunks_w = n_tiles * 2 (each 16-col tile = 2 FP16 rows of 8 cols).
+  // n_chunks_i32_w  = n_tiles * 4 (each 16-col tile = 4 FP32 rows of 4 cols).
   logic [14:0] dispatch_m_rows_w;
   logic [10:0] dispatch_n_tiles_w;
+  logic [11:0] dispatch_n_fp16_chunks_w;
   logic [12:0] dispatch_n_chunks_i32_w;
-  logic [31:0] dispatch_int8_units_w;
-  logic [31:0] dispatch_int32_units_w;
-  logic [31:0] dispatch_scale_rows_w;
+  logic [31:0] dispatch_fp16_units_w;
+  logic [31:0] dispatch_fp32_units_w;
   logic [31:0] dispatch_copy_units_w;
   logic [15:0] dispatch_src_rows_w;
-  logic [15:0] dispatch_trans_cols_w;
+  logic [15:0] dispatch_trans_byte_cols_w;
+  logic [15:0] dispatch_trans_elem_cols_w;
   logic [15:0] dispatch_src_buf_rows_w;
   logic [15:0] dispatch_src2_buf_rows_w;
   logic [15:0] dispatch_dst_buf_rows_w;
   logic        dispatch_unsupported_w;
   logic        dispatch_sram_oob_w;
-  logic        dispatch_is_vadd_int8_w;
+  logic        dispatch_is_vadd_fp16_w;
   logic        dispatch_is_vadd_bias_w;
-  logic        dispatch_is_scale_mul_int8_w;
-  logic        dispatch_is_scale_mul_int32_w;
-  logic        dispatch_is_requant_pc_w;
-  logic        dispatch_is_dequant_add_w;
+  logic        dispatch_is_sm_fp16_w;     // ABUF -> ABUF
+  logic        dispatch_is_sm_fp32_w;     // ACCUM -> ACCUM
+  logic        dispatch_is_sm_acc2fp16_w; // ACCUM -> ABUF (narrow)
   logic        dispatch_same_buf_overlap_w;
+  logic        dispatch_trans_misaligned_w;
 
-  logic [15:0] flat_src_row_w;
-  logic [15:0] flat_dst_row_w;
-
-  logic [31:0] trans_src_byte_addr_w;
-  logic [15:0] trans_src_row0_w;
-  logic [15:0] trans_src_row1_w;
-  logic [3:0]  trans_src_lane_w;
-  logic        trans_need_row1_w;
-  logic [15:0] trans_dst_row_w;
-  logic [127:0] trans_dst_data_w;
-  logic [127:0] trans_dst_merge_w;
-
-  logic [15:0] v8_src1_row_w;
-  logic [15:0] v8_src2_row_w;
-  logic [15:0] v8_dst_row_w;
-
-  logic [15:0] vbias_row_w;
-  logic [15:0] vacc_row_w;
-
-  logic [15:0] rq_src_row_w;
-  logic [15:0] rq_dst_row_w;
-  logic [15:0] rqpc_scale_row_w;
-  logic [15:0] dq_skip_row_w;
-
-  logic [127:0] trans_col_data_w;
-  logic [127:0] trans_partial_row_w;
-  logic [31:0] rq_src_row_full_w;
-  logic [31:0] rq_dst_row_full_w;
-  logic [127:0] rqpc_write_data_w;
-  logic [127:0] dq_write_data_w;
-  logic [127:0] scale_mul_write_data_w;
-
-  assign dispatch_m_rows_w      = ({5'h0, tile_m} + 15'd1) << 4;
-  assign dispatch_n_tiles_w     = {1'b0, tile_n} + 11'd1;
-  assign dispatch_n_chunks_i32_w = dispatch_n_tiles_w << 2;
-  assign dispatch_int8_units_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
-  assign dispatch_int32_units_w = dispatch_m_rows_w * dispatch_n_chunks_i32_w;
-  assign dispatch_scale_rows_w  = {20'h0, dispatch_n_tiles_w, 1'b0};
-  assign dispatch_copy_units_w  = {16'h0, b_length};
-  assign dispatch_src_rows_w    = {6'h0, b_src_rows, 4'h0};
-  assign dispatch_trans_cols_w  = (b_src_rows == 6'h0) ? 16'h0 : (b_length / {10'h0, b_src_rows});
-  assign dispatch_src_buf_rows_w = buf_rows(src1_buf);
+  assign dispatch_m_rows_w        = ({5'h0, tile_m} + 15'd1) << 4;
+  assign dispatch_n_tiles_w       = {1'b0, tile_n} + 11'd1;
+  assign dispatch_n_fp16_chunks_w = {1'b0, dispatch_n_tiles_w} << 1;
+  assign dispatch_n_chunks_i32_w  = {2'b0, dispatch_n_tiles_w} << 2;
+  assign dispatch_fp16_units_w    = {17'h0, dispatch_n_fp16_chunks_w} * {17'h0, dispatch_m_rows_w};
+  assign dispatch_fp32_units_w    = {19'h0, dispatch_n_chunks_i32_w} * {17'h0, dispatch_m_rows_w};
+  assign dispatch_copy_units_w    = {16'h0, b_length};
+  assign dispatch_src_rows_w      = {6'h0, b_src_rows, 4'h0};
+  assign dispatch_trans_byte_cols_w =
+      (b_src_rows == 6'h0) ? 16'h0 : (b_length / {10'h0, b_src_rows});
+  assign dispatch_trans_elem_cols_w = dispatch_trans_byte_cols_w >> 1;
+  assign dispatch_src_buf_rows_w  = buf_rows(src1_buf);
   assign dispatch_src2_buf_rows_w = buf_rows(src2_buf);
-  assign dispatch_dst_buf_rows_w = buf_rows(dst_buf);
-  assign dispatch_is_vadd_int8_w = (src1_buf == BUF_ABUF) &&
-                                   ((src2_buf == BUF_ABUF) || (src2_buf == BUF_WBUF)) &&
-                                   (dst_buf == BUF_ABUF);
-  assign dispatch_is_vadd_bias_w = (src1_buf == BUF_ACCUM) &&
-                                   (src2_buf == BUF_WBUF) &&
-                                   (dst_buf == BUF_ACCUM);
-  assign dispatch_is_scale_mul_int8_w = (src1_buf != BUF_ACCUM) && (dst_buf != BUF_ACCUM);
-  assign dispatch_is_scale_mul_int32_w = (src1_buf == BUF_ACCUM) && (dst_buf == BUF_ACCUM);
-  assign dispatch_is_requant_pc_w = (src1_buf == BUF_ACCUM) &&
-                                    (src2_buf != BUF_ACCUM) &&
-                                    (dst_buf != BUF_ACCUM);
-  assign dispatch_is_dequant_add_w = (src1_buf == BUF_ACCUM) &&
-                                     (src2_buf != BUF_ACCUM) &&
-                                     (dst_buf != BUF_ACCUM);
+  assign dispatch_dst_buf_rows_w  = buf_rows(dst_buf);
+
+  assign dispatch_is_vadd_fp16_w =
+      (src1_buf == BUF_ABUF) &&
+      ((src2_buf == BUF_ABUF) || (src2_buf == BUF_WBUF)) &&
+      (dst_buf == BUF_ABUF);
+  assign dispatch_is_vadd_bias_w =
+      (src1_buf == BUF_ACCUM) &&
+      (src2_buf == BUF_WBUF) &&
+      (dst_buf == BUF_ACCUM);
+
+  // FP16 modes accept any ABUF/WBUF combination on src1 and dst (matches the
+  // permissive _read_act_fp32 / _write_act paths in simulator_w8a16).
+  assign dispatch_is_sm_fp16_w =
+      (src1_buf != BUF_ACCUM) && (dst_buf != BUF_ACCUM);
+  assign dispatch_is_sm_fp32_w =
+      (src1_buf == BUF_ACCUM) && (dst_buf == BUF_ACCUM);
+  assign dispatch_is_sm_acc2fp16_w =
+      (src1_buf == BUF_ACCUM) && (dst_buf != BUF_ACCUM);
+
   assign dispatch_same_buf_overlap_w =
       (src1_buf == dst_buf) &&
       ({16'h0, src1_off} < ({16'h0, dst_off} + dispatch_copy_units_w)) &&
       ({16'h0, dst_off} < ({16'h0, src1_off} + dispatch_copy_units_w));
 
-  // Dispatch-time validation.
-  // Reject unsupported legal mode combinations before touching SRAM, and also
-  // reject whole-operation OOB ranges up front.
+  // Transpose alignment: byte_cols must be even (FP16 = 2 bytes), and both
+  // element dimensions must be multiples of 8 so the inner tile is full 8x8.
+  // The W8A16 codegen always emits 16-aligned dims, so this is non-restrictive
+  // for the shipping toolchain.
+  assign dispatch_trans_misaligned_w =
+      (dispatch_trans_byte_cols_w[0] != 1'b0) ||
+      (dispatch_trans_elem_cols_w[2:0] != 3'h0) ||
+      (dispatch_src_rows_w[2:0] != 3'h0);
+
+  // Dispatch-time validation. Reject unsupported mode combinations and whole
+  // SRAM ranges before touching memory.
   always_comb begin
     dispatch_unsupported_w = 1'b0;
     dispatch_sram_oob_w    = 1'b0;
@@ -560,76 +276,60 @@ module blocking_helper_engine
             ({1'b0, dst_off}  + {1'b0, b_length} > {1'b0, dispatch_dst_buf_rows_w});
 
         if (b_transpose) begin
-          if ((b_length != 16'h0) &&
-              ((b_src_rows == 6'h0) || ((b_length % {10'h0, b_src_rows}) != 16'h0) || (src1_buf == dst_buf)))
+          if (b_length == 16'h0)
+            dispatch_unsupported_w = 1'b0;
+          else if ((b_src_rows == 6'h0) ||
+                   ((b_length % {10'h0, b_src_rows}) != 16'h0) ||
+                   (src1_buf == dst_buf) ||
+                   dispatch_trans_misaligned_w)
             dispatch_unsupported_w = 1'b1;
         end
       end
 
       OP_VADD: begin
-        if (dispatch_is_vadd_int8_w) begin
+        if (dispatch_is_vadd_fp16_w) begin
           dispatch_sram_oob_w =
-              ({16'h0, src1_off} + dispatch_int8_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
-              ({16'h0, src2_off} + dispatch_int8_units_w > {16'h0, dispatch_src2_buf_rows_w}) ||
-              ({16'h0, dst_off}  + dispatch_int8_units_w > {16'h0, dispatch_dst_buf_rows_w});
+              ({16'h0, src1_off} + dispatch_fp16_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, src2_off} + dispatch_fp16_units_w > {16'h0, dispatch_src2_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_fp16_units_w > {16'h0, dispatch_dst_buf_rows_w});
         end else if (dispatch_is_vadd_bias_w) begin
           dispatch_sram_oob_w =
-              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
-              ({16'h0, src2_off} + {19'h0, dispatch_n_chunks_i32_w} > {16'h0, dispatch_src2_buf_rows_w}) ||
-              ({16'h0, dst_off}  + dispatch_int32_units_w > {16'h0, dispatch_dst_buf_rows_w});
+              ({16'h0, src1_off} + dispatch_fp32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, src2_off} + {20'h0, dispatch_n_fp16_chunks_w} > {16'h0, dispatch_src2_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_fp32_units_w > {16'h0, dispatch_dst_buf_rows_w});
         end else begin
           dispatch_unsupported_w = 1'b1;
         end
-      end
-
-      OP_REQUANT: begin
-        if ((src1_buf != BUF_ACCUM) || (dst_buf == BUF_ACCUM))
-          dispatch_unsupported_w = 1'b1;
-        else
-          dispatch_sram_oob_w =
-              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
-              ({16'h0, dst_off}  + dispatch_int8_units_w  > {16'h0, dispatch_dst_buf_rows_w});
-      end
-
-      OP_REQUANT_PC: begin
-        if (!dispatch_is_requant_pc_w)
-          dispatch_unsupported_w = 1'b1;
-        else
-          dispatch_sram_oob_w =
-              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
-              ({16'h0, src2_off} + dispatch_scale_rows_w > {16'h0, dispatch_src2_buf_rows_w}) ||
-              ({16'h0, dst_off}  + dispatch_int8_units_w > {16'h0, dispatch_dst_buf_rows_w});
       end
 
       OP_SCALE_MUL: begin
-        if (dispatch_is_scale_mul_int32_w) begin
+        if (dispatch_is_sm_fp16_w) begin
           dispatch_sram_oob_w =
-              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
-              ({16'h0, dst_off}  + dispatch_int32_units_w > {16'h0, dispatch_dst_buf_rows_w});
-        end else if (dispatch_is_scale_mul_int8_w) begin
+              ({16'h0, src1_off} + dispatch_fp16_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_fp16_units_w > {16'h0, dispatch_dst_buf_rows_w});
+        end else if (dispatch_is_sm_fp32_w) begin
           dispatch_sram_oob_w =
-              ({16'h0, src1_off} + dispatch_int8_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
-              ({16'h0, dst_off}  + dispatch_int8_units_w > {16'h0, dispatch_dst_buf_rows_w});
+              ({16'h0, src1_off} + dispatch_fp32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_fp32_units_w > {16'h0, dispatch_dst_buf_rows_w});
+        end else if (dispatch_is_sm_acc2fp16_w) begin
+          dispatch_sram_oob_w =
+              ({16'h0, src1_off} + dispatch_fp32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_fp16_units_w > {16'h0, dispatch_dst_buf_rows_w});
         end else begin
           dispatch_unsupported_w = 1'b1;
         end
       end
 
-      OP_DEQUANT_ADD: begin
-        if (!dispatch_is_dequant_add_w || (sreg == 4'hF))
-          dispatch_unsupported_w = 1'b1;
-        else
-          dispatch_sram_oob_w =
-              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
-              ({16'h0, src2_off} + dispatch_int8_units_w > {16'h0, dispatch_src2_buf_rows_w}) ||
-              ({16'h0, dst_off}  + dispatch_int8_units_w > {16'h0, dispatch_dst_buf_rows_w});
-      end
-
+      // REQUANT / REQUANT_PC / DEQUANT_ADD: unsupported in W8A16.
+      // Falling through default raises FAULT_UNSUPPORTED_OP.
       default:
         dispatch_unsupported_w = 1'b1;
     endcase
   end
 
+  // Flat-copy addressing.
+  logic [15:0] flat_src_row_w;
+  logic [15:0] flat_dst_row_w;
   assign flat_src_row_w =
       flat_backward_q ? (src1_off_q + b_length_q - 16'(step_idx_q) - 16'h1)
                       : (src1_off_q + 16'(step_idx_q));
@@ -637,89 +337,122 @@ module blocking_helper_engine
       flat_backward_q ? (dst_off_q + b_length_q - 16'(step_idx_q) - 16'h1)
                       : (dst_off_q + 16'(step_idx_q));
 
-  assign trans_src_byte_addr_w =
-      ({16'h0, src1_off_q} << 4) +
-      (({16'h0, trans_rbase_q} + {27'h0, trans_src_row_idx_q}) * {16'h0, trans_cols_q}) +
-      {16'h0, trans_cbase_q};
-  assign trans_src_row0_w  = trans_src_byte_addr_w[19:4];
-  assign trans_src_row1_w  = trans_src_row0_w + 16'h1;
-  assign trans_src_lane_w  = trans_src_byte_addr_w[3:0];
-  assign trans_need_row1_w = ({1'b0, trans_src_lane_w} + {1'b0, trans_width_q} > 6'd16);
+  // Transpose addressing (FP16-element granularity).
+  // Each source FP16 row spans (elem_cols / 8) SRAM rows. A cbase increment
+  // of 8 elements advances one SRAM row. Each block reads one 128-bit row
+  // per source row (8 FP16 = one full row, no spanning).
+  logic [15:0] trans_src_row_w;
+  logic [15:0] trans_dst_row_w;
+  logic [15:0] trans_elem_cols_q;
+  assign trans_src_row_w =
+      src1_off_q +
+      ((trans_rbase_q + {12'h0, trans_src_row_idx_q}) * (trans_elem_cols_q >> 3)) +
+      (trans_cbase_q >> 3);
   assign trans_dst_row_w =
       dst_off_q +
-      ((trans_cbase_q + {11'h0, trans_dst_row_idx_q}) * {10'h0, b_src_rows_q}) +
-      (trans_rbase_q >> 4);
+      ((trans_cbase_q + {12'h0, trans_dst_row_idx_q}) * (trans_row_count_q >> 3)) +
+      (trans_rbase_q >> 3);
 
-  assign v8_src1_row_w = src1_off_q + 16'(step_idx_q);
-  assign v8_src2_row_w = src2_off_q + 16'(step_idx_q);
-  assign v8_dst_row_w  = dst_off_q + 16'(step_idx_q);
-
-  assign vbias_row_w = src2_off_q + bias_chunk_q;
-  assign vacc_row_w  = src1_off_q + (bias_row_idx_q * n_chunks_i32_q) + bias_chunk_q;
-
-  assign rq_src_row_full_w = {16'h0, src1_off_q} +
-                             ({17'h0, rq_row_idx_q} * {19'h0, n_chunks_i32_q}) +
-                             ({19'h0, rq_col_chunk_q} << 2) +
-                             {30'h0, rq_part_q};
-  assign rq_dst_row_full_w = {16'h0, dst_off_q} +
-                             ({17'h0, rq_row_idx_q} * {21'h0, n_tiles_q}) +
-                             {21'h0, rq_col_chunk_q};
-  assign rq_src_row_w = rq_src_row_full_w[15:0];
-  assign rq_dst_row_w = rq_dst_row_full_w[15:0];
-  assign rqpc_scale_row_w = src2_off_q + ({4'h0, rq_col_chunk_q} << 1) + {15'h0, rq_part_q[0]};
-  assign dq_skip_row_w = src2_off_q + (rq_row_idx_q * n_tiles_q) + {5'h0, rq_col_chunk_q};
-
-  // Assemble one transposed destination column from the scratch tile and merge
-  // it with a partially covered destination row when the transpose edge is not
-  // a full 16-byte row.
+  // Transpose destination row data: gather column from 8 scratch entries.
+  logic [127:0] trans_dst_data_w;
   always_comb begin
-    trans_col_data_w = 128'h0;
-    for (int j = 0; j < 16; j++) begin
-      if (j < integer'(trans_height_q))
-        trans_col_data_w[(j * 8) +: 8] =
-            trans_scratch_q[j[3:0]][(integer'(trans_dst_row_idx_q) * 8) +: 8];
-    end
-
-    trans_partial_row_w = sram_a_rdata;
-    for (int j = 0; j < 16; j++) begin
-      if (j < integer'(trans_height_q))
-        trans_partial_row_w[(j * 8) +: 8] = trans_col_data_w[(j * 8) +: 8];
+    trans_dst_data_w = 128'h0;
+    for (int j = 0; j < 8; j++) begin
+      trans_dst_data_w[(j * 16) +: 16] =
+          trans_scratch_q[j][(integer'(trans_dst_row_idx_q) * 16) +: 16];
     end
   end
 
-  assign trans_dst_data_w  = trans_col_data_w;
-  assign trans_dst_merge_w = trans_partial_row_w;
+  // V16 (FP16 ABUF VADD) addressing.
+  logic [15:0] v16_src1_row_w;
+  logic [15:0] v16_src2_row_w;
+  logic [15:0] v16_dst_row_w;
+  assign v16_src1_row_w = src1_off_q + 16'(step_idx_q);
+  assign v16_src2_row_w = src2_off_q + 16'(step_idx_q);
+  assign v16_dst_row_w  = dst_off_q + 16'(step_idx_q);
 
+  // V16 (FP16 ABUF VADD) compute: 8 lanes per row, widen + add + narrow.
+  // sram_a_rdata holds src2 (latched from H_V16_READ port A request),
+  // sram_b_rdata holds src1.
+  logic [127:0] v16_write_data_w;
   always_comb begin
-    rqpc_write_data_w = 128'h0;
-    dq_write_data_w = 128'h0;
-    scale_mul_write_data_w = 128'h0;
+    v16_write_data_w = 128'h0;
+    for (int lane = 0; lane < 8; lane++)
+      v16_write_data_w[(lane * 16) +: 16] = fp32_to_fp16_bits(
+          fp32_add_bits(fp32_from_fp16_bits(get_u16(sram_b_rdata, lane)),
+                        fp32_from_fp16_bits(get_u16(sram_a_rdata, lane))));
+  end
 
-    for (int lane = 0; lane < 16; lane++) begin
-      logic signed [31:0] src_i32;
-      logic signed [63:0] scaled;
-      case (lane[3:2])
-        2'd0: src_i32 = rq_row0_q[(lane[1:0] * 32) +: 32];
-        2'd1: src_i32 = rq_row1_q[(lane[1:0] * 32) +: 32];
-        2'd2: src_i32 = rq_row2_q[(lane[1:0] * 32) +: 32];
-        default: src_i32 = rq_row3_q[(lane[1:0] * 32) +: 32];
-      endcase
-      scaled = fp16_mul_round_even(src_i32, pc_scale_chunk_q[lane]);
-      if (scaled > 64'sd127)
-        rqpc_write_data_w[(lane * 8) +: 8] = 8'h7F;
-      else if (scaled < -64'sd128)
-        rqpc_write_data_w[(lane * 8) +: 8] = 8'h80;
-      else
-        rqpc_write_data_w[(lane * 8) +: 8] = scaled[7:0];
+  // ACCUM bias VADD addressing.
+  // c4 = 2 * bias_chunk_q + c4_half_q (column-of-4 index inside the M row).
+  // bias FP16 row index = bias_chunk_q (each FP16 row spans 8 columns,
+  // covering 2 ACCUM 4-column chunks).
+  logic [15:0] vbias_row_w;
+  logic [15:0] vacc_row_w;
+  logic [15:0] vacc_c4_w;
+  assign vbias_row_w = src2_off_q + {4'h0, bias_chunk_q};
+  assign vacc_c4_w   = ({4'h0, bias_chunk_q} << 1) + {15'h0, c4_half_q};
+  assign vacc_row_w  = src1_off_q +
+                       ({1'b0, bias_row_idx_q} * {3'h0, n_chunks_i32_q}) +
+                       vacc_c4_w;
+  logic [15:0] vacc_dst_row_w;
+  assign vacc_dst_row_w = dst_off_q +
+                          ({1'b0, bias_row_idx_q} * {3'h0, n_chunks_i32_q}) +
+                          vacc_c4_w;
+
+  // VACC compute: 4 FP32 from ACCUM, 4 FP16 from the matching half of the
+  // bias row, widen + add.
+  logic [127:0] vacc_write_data_w;
+  always_comb begin
+    vacc_write_data_w = 128'h0;
+    for (int lane = 0; lane < 4; lane++)
+      vacc_write_data_w[(lane * 32) +: 32] = fp32_add_bits(
+          get_u32(sram_a_rdata, lane),
+          fp32_from_fp16_bits(
+              get_u16(bias_data_q, (integer'(c4_half_q) << 2) + lane)));
+  end
+
+  // SCALE_MUL one-read paths.
+  // For ABUF->ABUF: source row index = step_idx_q, 8 FP16 in, 8 FP16 out.
+  // For ACCUM->ACCUM: source row index = step_idx_q, 4 FP32 in, 4 FP32 out.
+  logic [15:0] sm1_src_row_w;
+  logic [15:0] sm1_dst_row_w;
+  assign sm1_src_row_w = src1_off_q + 16'(step_idx_q);
+  assign sm1_dst_row_w = dst_off_q + 16'(step_idx_q);
+
+  logic [127:0] sm1_write_data_w;
+  always_comb begin
+    sm1_write_data_w = 128'h0;
+    if (src1_buf_q == BUF_ACCUM) begin
+      for (int lane = 0; lane < 4; lane++)
+        sm1_write_data_w[(lane * 32) +: 32] =
+            fp32_mul_bits(get_u32(sram_b_rdata, lane), scale_fp32_q);
+    end else begin
+      for (int lane = 0; lane < 8; lane++)
+        sm1_write_data_w[(lane * 16) +: 16] = fp32_to_fp16_bits(
+            fp32_mul_bits(fp32_from_fp16_bits(get_u16(sram_b_rdata, lane)),
+                          scale_fp32_q));
     end
+  end
 
-    dq_write_data_w = dequant_add_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q,
-                                       skip_row_q, scale0_q, scale1_q);
+  // SCALE_MUL two-read path (ACCUM->ABUF narrowing).
+  // step_idx_q iterates output FP16 rows; each output row consumes 2 ACCUM
+  // rows (lanes 0..3 from row 0, lanes 4..7 from row 1).
+  logic [15:0] sm2_src_row_w;
+  logic [15:0] sm2_dst_row_w;
+  assign sm2_src_row_w = src1_off_q + (16'(step_idx_q) << 1) + {15'h0, sm_part_q};
+  assign sm2_dst_row_w = dst_off_q + 16'(step_idx_q);
 
-    if (src1_buf_q == BUF_ACCUM)
-      scale_mul_write_data_w = scale_mul_i32_row(sram_b_rdata, scale0_q);
-    else
-      scale_mul_write_data_w = scale_mul_i8_row(sram_b_rdata, scale0_q);
+  // Combine the two latched ACCUM rows into 8 FP16 lanes.
+  logic [127:0] sm2_write_data_w;
+  always_comb begin
+    sm2_write_data_w = 128'h0;
+    for (int lane = 0; lane < 4; lane++) begin
+      sm2_write_data_w[(lane * 16) +: 16] = fp32_to_fp16_bits(
+          fp32_mul_bits(get_u32(sm_row0_q, lane), scale_fp32_q));
+      sm2_write_data_w[((lane + 4) * 16) +: 16] = fp32_to_fp16_bits(
+          fp32_mul_bits(get_u32(sm_row1_q, lane), scale_fp32_q));
+    end
   end
 
   // Main helper FSM. SRAM is synchronous, so read states issue a request and
@@ -738,58 +471,52 @@ module blocking_helper_engine
       b_length_q        <= 16'h0;
       b_src_rows_q      <= 6'h0;
       b_transpose_q     <= 1'b0;
-      scale0_q          <= 16'h0;
-      scale1_q          <= 16'h0;
       m_rows_q          <= 15'h0;
       n_tiles_q         <= 11'h0;
+      n_fp16_chunks_q   <= 12'h0;
       n_chunks_i32_q    <= 13'h0;
+      scale_fp32_q      <= 32'h0;
       fault_code_r      <= 4'(FAULT_NONE);
       step_idx_q        <= 32'h0;
       flat_backward_q   <= 1'b0;
       trans_row_count_q <= 16'h0;
       trans_cols_q      <= 16'h0;
+      trans_elem_cols_q <= 16'h0;
       trans_rbase_q     <= 16'h0;
       trans_cbase_q     <= 16'h0;
-      trans_height_q    <= 5'h0;
-      trans_width_q     <= 5'h0;
-      trans_src_row_idx_q <= 5'h0;
-      trans_dst_row_idx_q <= 5'h0;
-      trans_first_row_q <= 128'h0;
-      bias_chunk_q      <= 16'h0;
+      trans_height_q    <= 4'h0;
+      trans_width_q     <= 4'h0;
+      trans_src_row_idx_q <= 4'h0;
+      trans_dst_row_idx_q <= 4'h0;
+      bias_chunk_q      <= 12'h0;
+      c4_half_q         <= 1'b0;
       bias_row_idx_q    <= 15'h0;
       bias_data_q       <= 128'h0;
-      rq_row_idx_q      <= 15'h0;
-      rq_col_chunk_q    <= 11'h0;
-      rq_part_q         <= 2'h0;
-      rq_row0_q         <= 128'h0;
-      rq_row1_q         <= 128'h0;
-      rq_row2_q         <= 128'h0;
-      rq_row3_q         <= 128'h0;
-      skip_row_q        <= 128'h0;
-      for (int i = 0; i < 16; i++)
-        pc_scale_chunk_q[i] <= 16'h0;
-      for (int j = 0; j < 16; j++)
+      sm_part_q         <= 1'b0;
+      sm_row0_q         <= 128'h0;
+      sm_row1_q         <= 128'h0;
+      for (int j = 0; j < 8; j++)
         trans_scratch_q[j] <= 128'h0;
     end else begin
       case (state)
         H_IDLE: begin
           if (dispatch) begin
-            opcode_q       <= opcode;
-            src1_buf_q     <= src1_buf;
-            src2_buf_q     <= src2_buf;
-            dst_buf_q      <= dst_buf;
-            src1_off_q     <= src1_off;
-            src2_off_q     <= src2_off;
-            dst_off_q      <= dst_off;
-            sreg_q         <= sreg;
-            b_length_q     <= b_length;
-            b_src_rows_q   <= b_src_rows;
-            b_transpose_q  <= b_transpose;
-            scale0_q       <= scale0_data;
-            scale1_q       <= scale1_data;
-            m_rows_q       <= dispatch_m_rows_w;
-            n_tiles_q      <= dispatch_n_tiles_w;
-            n_chunks_i32_q <= dispatch_n_chunks_i32_w;
+            opcode_q        <= opcode;
+            src1_buf_q      <= src1_buf;
+            src2_buf_q      <= src2_buf;
+            dst_buf_q       <= dst_buf;
+            src1_off_q      <= src1_off;
+            src2_off_q      <= src2_off;
+            dst_off_q       <= dst_off;
+            sreg_q          <= sreg;
+            b_length_q      <= b_length;
+            b_src_rows_q    <= b_src_rows;
+            b_transpose_q   <= b_transpose;
+            m_rows_q        <= dispatch_m_rows_w;
+            n_tiles_q       <= dispatch_n_tiles_w;
+            n_fp16_chunks_q <= dispatch_n_fp16_chunks_w;
+            n_chunks_i32_q  <= dispatch_n_chunks_i32_w;
+            scale_fp32_q    <= fp32_from_fp16_bits(scale0_data);
 
             if (dispatch_unsupported_w) begin
               fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
@@ -804,14 +531,15 @@ module blocking_helper_engine
                     state <= H_IDLE;
                   end else if (b_transpose) begin
                     trans_row_count_q   <= dispatch_src_rows_w;
-                    trans_cols_q        <= dispatch_trans_cols_w;
+                    trans_cols_q        <= dispatch_trans_elem_cols_w;
+                    trans_elem_cols_q   <= dispatch_trans_elem_cols_w;
                     trans_rbase_q       <= 16'h0;
                     trans_cbase_q       <= 16'h0;
-                    trans_height_q      <= block_span(dispatch_src_rows_w, 16'h0);
-                    trans_width_q       <= block_span(dispatch_trans_cols_w, 16'h0);
-                    trans_src_row_idx_q <= 5'h0;
-                    trans_dst_row_idx_q <= 5'h0;
-                    state               <= H_TSRC_REQ1;
+                    trans_height_q      <= 4'd8;
+                    trans_width_q       <= 4'd8;
+                    trans_src_row_idx_q <= 4'h0;
+                    trans_dst_row_idx_q <= 4'h0;
+                    state               <= H_TSRC_REQ;
                   end else begin
                     step_idx_q      <= 32'h0;
                     flat_backward_q <= dispatch_same_buf_overlap_w && (dst_off > src1_off);
@@ -820,40 +548,25 @@ module blocking_helper_engine
                 end
 
                 OP_VADD: begin
-                  if (dispatch_is_vadd_int8_w) begin
+                  if (dispatch_is_vadd_fp16_w) begin
                     step_idx_q <= 32'h0;
-                    state      <= H_V8_READ;
+                    state      <= H_V16_READ;
                   end else begin
-                    bias_chunk_q   <= 16'h0;
+                    bias_chunk_q   <= 12'h0;
+                    c4_half_q      <= 1'b0;
                     bias_row_idx_q <= 15'h0;
                     state          <= H_VB_REQ;
                   end
                 end
 
-                OP_REQUANT: begin
-                  rq_row_idx_q   <= 15'h0;
-                  rq_col_chunk_q <= 11'h0;
-                  rq_part_q      <= 2'h0;
-                  state          <= H_RQ_REQ;
-                end
-
-                OP_REQUANT_PC: begin
-                  rq_row_idx_q   <= 15'h0;
-                  rq_col_chunk_q <= 11'h0;
-                  rq_part_q      <= 2'h0;
-                  state          <= H_RQPC_SCALE0_REQ;
-                end
-
                 OP_SCALE_MUL: begin
                   step_idx_q <= 32'h0;
-                  state      <= H_SM_REQ;
-                end
-
-                OP_DEQUANT_ADD: begin
-                  rq_row_idx_q   <= 15'h0;
-                  rq_col_chunk_q <= 11'h0;
-                  rq_part_q      <= 2'h0;
-                  state          <= H_DQ_SKIP_REQ;
+                  if (dispatch_is_sm_acc2fp16_w) begin
+                    sm_part_q <= 1'b0;
+                    state     <= H_SM2_REQ;
+                  end else begin
+                    state <= H_SM1_REQ;
+                  end
                 end
 
                 default: begin
@@ -865,6 +578,7 @@ module blocking_helper_engine
           end
         end
 
+        // BUF_COPY flat byte stream.
         H_FLAT_READ: begin
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
@@ -886,119 +600,73 @@ module blocking_helper_engine
           end
         end
 
-        H_TSRC_REQ1: begin
+        // BUF_COPY transpose: 8 FP16 source rows -> 8 FP16 dest rows per block.
+        H_TSRC_REQ: begin
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
           end else begin
-            state <= H_TSRC_CAP1;
+            state <= H_TSRC_LATCH;
           end
         end
 
-        H_TSRC_CAP1: begin
-          // Gather one source row slice into the 16x16 transpose scratch tile.
-          if (trans_need_row1_w) begin
-            trans_first_row_q <= sram_a_rdata;
-            state             <= H_TSRC_REQ2;
+        H_TSRC_LATCH: begin
+          trans_scratch_q[trans_src_row_idx_q[2:0]] <= sram_a_rdata;
+          if (trans_src_row_idx_q + 4'd1 >= trans_height_q) begin
+            trans_dst_row_idx_q <= 4'h0;
+            state               <= H_TDST_WRITE;
           end else begin
-            trans_scratch_q[trans_src_row_idx_q[3:0]] <= extract_window(
-                sram_a_rdata, 128'h0, trans_src_lane_w, trans_width_q);
-            if (trans_src_row_idx_q + 5'd1 >= trans_height_q) begin
-              trans_dst_row_idx_q <= 5'h0;
-              if (trans_height_q == 5'd16)
-                state <= H_TDST_WRITE;
-              else
-                state <= H_TDST_REQ;
-            end else begin
-              trans_src_row_idx_q <= trans_src_row_idx_q + 5'd1;
-              state               <= H_TSRC_REQ1;
-            end
-          end
-        end
-
-        H_TSRC_REQ2: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else begin
-            state <= H_TSRC_CAP2;
-          end
-        end
-
-        H_TSRC_CAP2: begin
-          trans_scratch_q[trans_src_row_idx_q[3:0]] <= extract_window(
-              trans_first_row_q, sram_a_rdata, trans_src_lane_w, trans_width_q);
-          if (trans_src_row_idx_q + 5'd1 >= trans_height_q) begin
-            trans_dst_row_idx_q <= 5'h0;
-            if (trans_height_q == 5'd16)
-              state <= H_TDST_WRITE;
-            else
-              state <= H_TDST_REQ;
-          end else begin
-            trans_src_row_idx_q <= trans_src_row_idx_q + 5'd1;
-            state               <= H_TSRC_REQ1;
-          end
-        end
-
-        H_TDST_REQ: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else begin
-            state <= H_TDST_WRITE;
+            trans_src_row_idx_q <= trans_src_row_idx_q + 4'd1;
+            state               <= H_TSRC_REQ;
           end
         end
 
         H_TDST_WRITE: begin
-          // Write one destination row of the transposed tile. Partial rows use
-          // read-modify-write through H_TDST_REQ.
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
-          end else if (trans_dst_row_idx_q + 5'd1 < trans_width_q) begin
-            trans_dst_row_idx_q <= trans_dst_row_idx_q + 5'd1;
-            if (trans_height_q == 5'd16)
-              state <= H_TDST_WRITE;
-            else
-              state <= H_TDST_REQ;
-          end else if ({16'h0, trans_cbase_q} + {27'h0, trans_width_q} < {16'h0, trans_cols_q}) begin
-            trans_cbase_q       <= trans_cbase_q + 16'd16;
-            trans_width_q       <= block_span(trans_cols_q, trans_cbase_q + 16'd16);
-            trans_src_row_idx_q <= 5'h0;
-            state               <= H_TSRC_REQ1;
-          end else if ({16'h0, trans_rbase_q} + {27'h0, trans_height_q} < {16'h0, trans_row_count_q}) begin
-            trans_rbase_q       <= trans_rbase_q + 16'd16;
+          end else if (trans_dst_row_idx_q + 4'd1 < trans_width_q) begin
+            trans_dst_row_idx_q <= trans_dst_row_idx_q + 4'd1;
+            state               <= H_TDST_WRITE;
+          end else if ({16'h0, trans_cbase_q} + {28'h0, trans_width_q} < {16'h0, trans_cols_q}) begin
+            trans_cbase_q       <= trans_cbase_q + 16'd8;
+            trans_src_row_idx_q <= 4'h0;
+            state               <= H_TSRC_REQ;
+          end else if ({16'h0, trans_rbase_q} + {28'h0, trans_height_q} < {16'h0, trans_row_count_q}) begin
+            trans_rbase_q       <= trans_rbase_q + 16'd8;
             trans_cbase_q       <= 16'h0;
-            trans_height_q      <= block_span(trans_row_count_q, trans_rbase_q + 16'd16);
-            trans_width_q       <= block_span(trans_cols_q, 16'h0);
-            trans_src_row_idx_q <= 5'h0;
-            state               <= H_TSRC_REQ1;
+            trans_src_row_idx_q <= 4'h0;
+            state               <= H_TSRC_REQ;
           end else begin
             state <= H_IDLE;
           end
         end
 
-        H_V8_READ: begin
+        // FP16 ABUF VADD: read src1 (port B) + src2 (port A), widen + add +
+        // narrow, write dst (port A).
+        H_V16_READ: begin
           if (sram_a_fault || sram_b_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
           end else begin
-            state <= H_V8_WRITE;
+            state <= H_V16_WRITE;
           end
         end
 
-        H_V8_WRITE: begin
+        H_V16_WRITE: begin
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
-          end else if (step_idx_q + 32'd1 >= (m_rows_q * n_tiles_q)) begin
+          end else if (step_idx_q + 32'd1 >= dispatch_fp16_units_w) begin
             state <= H_IDLE;
           end else begin
             step_idx_q <= step_idx_q + 32'd1;
-            state      <= H_V8_READ;
+            state      <= H_V16_READ;
           end
         end
 
+        // ACCUM VADD bias: load one FP16 bias row (8 columns) and reuse it
+        // across all M rows for the 2 ACCUM 4-column chunks it covers.
         H_VB_REQ: begin
           if (sram_b_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
@@ -1009,10 +677,9 @@ module blocking_helper_engine
         end
 
         H_VB_LATCH: begin
-          // Reuse the same 1xN bias chunk across every output row before
-          // advancing to the next chunk.
           bias_data_q    <= sram_b_rdata;
           bias_row_idx_q <= 15'h0;
+          c4_half_q      <= 1'b0;
           state          <= H_VACC_READ;
         end
 
@@ -1029,74 +696,36 @@ module blocking_helper_engine
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
+          end else if (c4_half_q == 1'b0) begin
+            // Advance to the high half of the same FP16 bias row, same M row.
+            c4_half_q <= 1'b1;
+            state     <= H_VACC_READ;
           end else if (bias_row_idx_q + 15'd1 < m_rows_q) begin
             bias_row_idx_q <= bias_row_idx_q + 15'd1;
+            c4_half_q      <= 1'b0;
             state          <= H_VACC_READ;
-          end else if ({16'h0, bias_chunk_q} + 32'd1 < {19'h0, n_chunks_i32_q}) begin
-            bias_chunk_q <= bias_chunk_q + 16'd1;
-            state       <= H_VB_REQ;
+          end else if ({20'h0, bias_chunk_q} + 32'd1 < {20'h0, n_fp16_chunks_q}) begin
+            bias_chunk_q <= bias_chunk_q + 12'd1;
+            state        <= H_VB_REQ;
           end else begin
             state <= H_IDLE;
           end
         end
 
-        H_RQ_REQ: begin
+        // SCALE_MUL one-read-one-write (ABUF->ABUF or ACCUM->ACCUM).
+        H_SM1_REQ: begin
           if (sram_b_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
           end else begin
-            state <= H_RQ_LATCH;
+            state <= H_SM1_WRITE;
           end
         end
 
-        H_RQ_LATCH: begin
-          // Four ACCUM rows are collected before one packed INT8 row is written.
-          case (rq_part_q)
-            2'd0: rq_row0_q <= sram_b_rdata;
-            2'd1: rq_row1_q <= sram_b_rdata;
-            2'd2: rq_row2_q <= sram_b_rdata;
-            default: rq_row3_q <= sram_b_rdata;
-          endcase
-
-          if (rq_part_q == 2'd3) begin
-            state <= H_RQ_WRITE;
-          end else begin
-            rq_part_q <= rq_part_q + 2'd1;
-            state     <= H_RQ_REQ;
-          end
-        end
-
-        H_RQ_WRITE: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else if (rq_col_chunk_q + 11'd1 < n_tiles_q) begin
-            rq_col_chunk_q <= rq_col_chunk_q + 11'd1;
-            rq_part_q      <= 2'd0;
-            state          <= H_RQ_REQ;
-          end else if (rq_row_idx_q + 15'd1 < m_rows_q) begin
-            rq_row_idx_q   <= rq_row_idx_q + 15'd1;
-            rq_col_chunk_q <= 11'd0;
-            rq_part_q      <= 2'd0;
-            state          <= H_RQ_REQ;
-          end else begin
-            state <= H_IDLE;
-          end
-        end
-
-        H_SM_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else begin
-            state <= H_SM_WRITE;
-          end
-        end
-
-        H_SM_WRITE: begin
+        H_SM1_WRITE: begin
           logic [31:0] total_rows_w;
-          total_rows_w = (src1_buf_q == BUF_ACCUM) ? (m_rows_q * n_chunks_i32_q)
-                                                   : (m_rows_q * n_tiles_q);
+          total_rows_w = (src1_buf_q == BUF_ACCUM) ? dispatch_fp32_units_w
+                                                   : dispatch_fp16_units_w;
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
@@ -1104,138 +733,41 @@ module blocking_helper_engine
             state <= H_IDLE;
           end else begin
             step_idx_q <= step_idx_q + 32'd1;
-            state      <= H_SM_REQ;
+            state      <= H_SM1_REQ;
           end
         end
 
-        H_RQPC_SCALE0_REQ: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else begin
-            state <= H_RQPC_SCALE0_LATCH;
-          end
-        end
-
-        H_RQPC_SCALE0_LATCH: begin
-          for (int lane = 0; lane < 8; lane++)
-            pc_scale_chunk_q[lane] <= get_u16(sram_a_rdata, lane);
-          rq_part_q <= 2'd1;
-          state     <= H_RQPC_SCALE1_REQ;
-        end
-
-        H_RQPC_SCALE1_REQ: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else begin
-            state <= H_RQPC_SCALE1_LATCH;
-          end
-        end
-
-        H_RQPC_SCALE1_LATCH: begin
-          for (int lane = 0; lane < 8; lane++)
-            pc_scale_chunk_q[lane + 8] <= get_u16(sram_a_rdata, lane);
-          rq_row_idx_q <= 15'h0;
-          rq_part_q    <= 2'd0;
-          state        <= H_RQPC_REQ;
-        end
-
-        H_RQPC_REQ: begin
+        // SCALE_MUL two-read-one-write (ACCUM -> ABUF narrow).
+        H_SM2_REQ: begin
           if (sram_b_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
           end else begin
-            state <= H_RQPC_LATCH;
+            state <= H_SM2_LATCH;
           end
         end
 
-        H_RQPC_LATCH: begin
-          case (rq_part_q)
-            2'd0: rq_row0_q <= sram_b_rdata;
-            2'd1: rq_row1_q <= sram_b_rdata;
-            2'd2: rq_row2_q <= sram_b_rdata;
-            default: rq_row3_q <= sram_b_rdata;
-          endcase
-
-          if (rq_part_q == 2'd3) begin
-            state <= H_RQPC_WRITE;
+        H_SM2_LATCH: begin
+          if (sm_part_q == 1'b0) begin
+            sm_row0_q <= sram_b_rdata;
+            sm_part_q <= 1'b1;
+            state     <= H_SM2_REQ;
           end else begin
-            rq_part_q <= rq_part_q + 2'd1;
-            state     <= H_RQPC_REQ;
+            sm_row1_q <= sram_b_rdata;
+            state     <= H_SM2_WRITE;
           end
         end
 
-        H_RQPC_WRITE: begin
+        H_SM2_WRITE: begin
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= H_FAULT;
-          end else if (rq_row_idx_q + 15'd1 < m_rows_q) begin
-            rq_row_idx_q <= rq_row_idx_q + 15'd1;
-            rq_part_q    <= 2'd0;
-            state        <= H_RQPC_REQ;
-          end else if (rq_col_chunk_q + 11'd1 < n_tiles_q) begin
-            rq_col_chunk_q <= rq_col_chunk_q + 11'd1;
-            rq_part_q      <= 2'd0;
-            state          <= H_RQPC_SCALE0_REQ;
-          end else begin
+          end else if (step_idx_q + 32'd1 >= dispatch_fp16_units_w) begin
             state <= H_IDLE;
-          end
-        end
-
-        H_DQ_SKIP_REQ: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
           end else begin
-            state <= H_DQ_SKIP_LATCH;
-          end
-        end
-
-        H_DQ_SKIP_LATCH: begin
-          skip_row_q <= sram_a_rdata;
-          rq_part_q  <= 2'd0;
-          state      <= H_DQ_REQ;
-        end
-
-        H_DQ_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else begin
-            state <= H_DQ_LATCH;
-          end
-        end
-
-        H_DQ_LATCH: begin
-          case (rq_part_q)
-            2'd0: rq_row0_q <= sram_b_rdata;
-            2'd1: rq_row1_q <= sram_b_rdata;
-            2'd2: rq_row2_q <= sram_b_rdata;
-            default: rq_row3_q <= sram_b_rdata;
-          endcase
-
-          if (rq_part_q == 2'd3) begin
-            state <= H_DQ_WRITE;
-          end else begin
-            rq_part_q <= rq_part_q + 2'd1;
-            state     <= H_DQ_REQ;
-          end
-        end
-
-        H_DQ_WRITE: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= H_FAULT;
-          end else if (rq_col_chunk_q + 11'd1 < n_tiles_q) begin
-            rq_col_chunk_q <= rq_col_chunk_q + 11'd1;
-            state          <= H_DQ_SKIP_REQ;
-          end else if (rq_row_idx_q + 15'd1 < m_rows_q) begin
-            rq_row_idx_q   <= rq_row_idx_q + 15'd1;
-            rq_col_chunk_q <= 11'd0;
-            state          <= H_DQ_SKIP_REQ;
-          end else begin
-            state <= H_IDLE;
+            step_idx_q <= step_idx_q + 32'd1;
+            sm_part_q  <= 1'b0;
+            state      <= H_SM2_REQ;
           end
         end
 
@@ -1248,8 +780,8 @@ module blocking_helper_engine
   end
 
   // State-to-SRAM decode.
-  // Port A handles all writes and most reads; port B is only used for the
-  // second source stream in VADD / REQUANT / bias load.
+  // Port A handles all writes and most reads; port B is used for the second
+  // source stream in VADD and for SCALE_MUL reads.
   always_comb begin
     helper_busy       = (state != H_IDLE) && (state != H_FAULT);
     helper_fault      = (state == H_FAULT);
@@ -1281,54 +813,37 @@ module blocking_helper_engine
         sram_a_wdata = sram_a_rdata;
       end
 
-      H_TSRC_REQ1: begin
+      H_TSRC_REQ: begin
         sram_a_en  = 1'b1;
         sram_a_we  = 1'b0;
         sram_a_buf = src1_buf_q;
-        sram_a_row = trans_src_row0_w;
-      end
-
-      H_TSRC_REQ2: begin
-        sram_a_en  = 1'b1;
-        sram_a_we  = 1'b0;
-        sram_a_buf = src1_buf_q;
-        sram_a_row = trans_src_row1_w;
-      end
-
-      H_TDST_REQ: begin
-        sram_a_en  = 1'b1;
-        sram_a_we  = 1'b0;
-        sram_a_buf = dst_buf_q;
-        sram_a_row = trans_dst_row_w;
+        sram_a_row = trans_src_row_w;
       end
 
       H_TDST_WRITE: begin
-        sram_a_en  = 1'b1;
-        sram_a_we  = 1'b1;
-        sram_a_buf = dst_buf_q;
-        sram_a_row = trans_dst_row_w;
-        if (trans_height_q == 5'd16)
-          sram_a_wdata = trans_dst_data_w;
-        else
-          sram_a_wdata = trans_dst_merge_w;
-      end
-
-      H_V8_READ: begin
-        sram_a_en  = 1'b1;
-        sram_a_we  = 1'b0;
-        sram_a_buf = src2_buf_q;
-        sram_a_row = v8_src2_row_w;
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = v8_src1_row_w;
-      end
-
-      H_V8_WRITE: begin
         sram_a_en    = 1'b1;
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
-        sram_a_row   = v8_dst_row_w;
-        sram_a_wdata = sat_add_int8_row(sram_b_rdata, sram_a_rdata);
+        sram_a_row   = trans_dst_row_w;
+        sram_a_wdata = trans_dst_data_w;
+      end
+
+      H_V16_READ: begin
+        sram_a_en  = 1'b1;
+        sram_a_we  = 1'b0;
+        sram_a_buf = src2_buf_q;
+        sram_a_row = v16_src2_row_w;
+        sram_b_en  = 1'b1;
+        sram_b_buf = src1_buf_q;
+        sram_b_row = v16_src1_row_w;
+      end
+
+      H_V16_WRITE: begin
+        sram_a_en    = 1'b1;
+        sram_a_we    = 1'b1;
+        sram_a_buf   = dst_buf_q;
+        sram_a_row   = v16_dst_row_w;
+        sram_a_wdata = v16_write_data_w;
       end
 
       H_VB_REQ: begin
@@ -1348,90 +863,48 @@ module blocking_helper_engine
         sram_a_en    = 1'b1;
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
-        sram_a_row   = dst_off_q + (bias_row_idx_q * n_chunks_i32_q) + bias_chunk_q;
-        sram_a_wdata = add_wrap_int32_row(sram_a_rdata, bias_data_q);
+        sram_a_row   = vacc_dst_row_w;
+        sram_a_wdata = vacc_write_data_w;
       end
 
-      H_RQ_REQ: begin
+      H_SM1_REQ: begin
         sram_b_en  = 1'b1;
         sram_b_buf = src1_buf_q;
-        sram_b_row = rq_src_row_w;
+        sram_b_row = sm1_src_row_w;
       end
 
-      H_RQ_WRITE: begin
+      H_SM1_WRITE: begin
         sram_a_en    = 1'b1;
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
-        sram_a_row   = rq_dst_row_w;
-        sram_a_wdata = requant_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q, scale0_q);
+        sram_a_row   = sm1_dst_row_w;
+        sram_a_wdata = sm1_write_data_w;
       end
 
-      H_SM_REQ: begin
+      H_SM2_REQ: begin
         sram_b_en  = 1'b1;
         sram_b_buf = src1_buf_q;
-        sram_b_row = src1_off_q + 16'(step_idx_q);
+        sram_b_row = sm2_src_row_w;
       end
 
-      H_SM_WRITE: begin
+      H_SM2_WRITE: begin
         sram_a_en    = 1'b1;
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
-        sram_a_row   = dst_off_q + 16'(step_idx_q);
-        sram_a_wdata = scale_mul_write_data_w;
-      end
-
-      H_RQPC_SCALE0_REQ: begin
-        sram_a_en  = 1'b1;
-        sram_a_we  = 1'b0;
-        sram_a_buf = src2_buf_q;
-        sram_a_row = rqpc_scale_row_w;
-      end
-
-      H_RQPC_SCALE1_REQ: begin
-        sram_a_en  = 1'b1;
-        sram_a_we  = 1'b0;
-        sram_a_buf = src2_buf_q;
-        sram_a_row = rqpc_scale_row_w;
-      end
-
-      H_RQPC_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = rq_src_row_w;
-      end
-
-      H_RQPC_WRITE: begin
-        sram_a_en    = 1'b1;
-        sram_a_we    = 1'b1;
-        sram_a_buf   = dst_buf_q;
-        sram_a_row   = rq_dst_row_w;
-        sram_a_wdata = rqpc_write_data_w;
-      end
-
-      H_DQ_SKIP_REQ: begin
-        sram_a_en  = 1'b1;
-        sram_a_we  = 1'b0;
-        sram_a_buf = src2_buf_q;
-        sram_a_row = dq_skip_row_w;
-      end
-
-      H_DQ_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = rq_src_row_w;
-      end
-
-      H_DQ_WRITE: begin
-        sram_a_en    = 1'b1;
-        sram_a_we    = 1'b1;
-        sram_a_buf   = dst_buf_q;
-        sram_a_row   = rq_dst_row_w;
-        sram_a_wdata = dq_write_data_w;
+        sram_a_row   = sm2_dst_row_w;
+        sram_a_wdata = sm2_write_data_w;
       end
 
       default: ;
     endcase
   end
+
+  // Unused — kept for synthesis-side lint quietness on byte helpers that may
+  // become useful for diagnostic instrumentation.
+  /* verilator lint_off UNUSED */
+  logic [7:0] _unused_byte;
+  assign _unused_byte = get_byte(128'h0, 0);
+  /* verilator lint_on UNUSED */
 
 endmodule
 
