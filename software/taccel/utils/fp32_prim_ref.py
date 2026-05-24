@@ -114,14 +114,20 @@ def fp32_exp(x) -> np.float32:
 
 
 # ─── erf / gelu : A&S 7.1.26, identical structure to sfu.py:_erf_poly ─────────
+#
+# Constants are co-defined with rtl/src/include/fp32_prim_pkg.sv (FP32_ERF_*).
+# Some literals (A3, A4, P) round to different FP32 bit patterns than the
+# RTL's bit-exact constants; we must use bits_to_f32 to lock the bytes,
+# otherwise fp32_gelu / fp32_erf diverge from RTL by 1–2 FP16 ULPs (caught
+# in rtl/cocotb/test_sfu.py during Phase 3).
 
-_ERF_A1 = f32(0.254829592)
-_ERF_A2 = f32(-0.284496736)
-_ERF_A3 = f32(1.421413741)
-_ERF_A4 = f32(-1.453152027)
-_ERF_A5 = f32(1.061405429)
-_ERF_P = f32(0.3275911)
-_INV_SQRT2 = f32(0.7071067811865476)      # 0x3F3504F3
+_ERF_A1 = bits_to_f32(0x3E827906)
+_ERF_A2 = bits_to_f32(0xBE91A98E)
+_ERF_A3 = bits_to_f32(0x3FB5D78E)
+_ERF_A4 = bits_to_f32(0xBFBA0005)
+_ERF_A5 = bits_to_f32(0x3F87DC22)
+_ERF_P = bits_to_f32(0x3EA7B9D2)
+_INV_SQRT2 = bits_to_f32(0x3F3504F3)
 
 
 def fp32_erf(x) -> np.float32:
