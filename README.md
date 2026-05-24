@@ -110,42 +110,39 @@ Useful entry points:
 
 ## Precision Modes
 
-The software toolchain supports three precision modes, selectable via
+The software toolchain supports two precision modes, selectable via
 `--mode` on the user-facing tools (`compile_model.py`, `run_golden.py`,
-`benchmark_fp32_vs_int8.py`, `batch_compare_rtl_golden.py`,
 `profile_memory.py`):
 
-| Mode | Weights | Activations | Accumulators | RTL parity |
-|---|---|---|---|---|
-| `w8a8` (default) | INT8 per-channel | INT8 per-tensor | INT32 | Yes — bit-exact |
-| `w8a16` | INT8 per-channel → FP16 dequant in DRAM | FP16 | FP32 (mixed-precision standard) | **Suspended** |
-| `w8a32` | INT8 per-channel → FP32 dequant in DRAM | FP32 | FP32 (reinterpret ACCUM) | **Suspended** |
+| Mode | Weights | Activations | Accumulators |
+|---|---|---|---|
+| `w8a16` (default, shipping) | INT8 per-channel → FP16 dequant in DRAM | FP16 | FP32 (mixed-precision standard) |
+| `w8a32` | INT8 per-channel → FP32 dequant in DRAM | FP32 | FP32 (reinterpret ACCUM) |
 
-W8A8 is the production path: it matches the RTL exactly and is what
-`batch_compare_rtl_golden.py` signs off against. W8A16 and W8A32 are
-software-only paths used to measure the accuracy ceiling of weight-
-quantization-only inference end-to-end through the real compiler +
-golden simulator. They bypass every activation-side calibration knob
-and emit no `REQUANT*` / `DEQUANT_ADD` opcodes. The 5 INT8-hardwired
-RTL module groups (`systolic_array`, `systolic_pe`,
-`systolic_controller`, `blocking_helper_engine`, `sfu_engine`) would
-compute garbage on FP bit patterns, so RTL parity is explicitly
-disabled in both FP modes; running `batch_compare_rtl_golden.py
---mode w8a16` (or `--mode w8a32`) errors out with a pointer to
-`docs/precision_modes.md`.
+W8A16 is the shipping path: per-channel INT8 weights are dequantized
+into FP16 in DRAM at compile time, FP16 activations live in ABUF, and
+the FP32 accumulator holds the matmul partial sums. W8A32 doubles the
+dequant-weight DRAM footprint in exchange for an extra decimal digit of
+numerical headroom; it serves as the FP32 weight-quant ceiling reference.
+
+The legacy W8A8 (INT8 weights + INT8 activations) path was removed: the
+INT8-activation floor on ViT was the dominant accuracy-loss term and the
+calibration plumbing it required (SmoothQuant / Hessian-guided / twin
+uniform / per-tensor activation scales) was incompatible with a clean
+toolchain. The RTL (`rtl/`) remains as historical reference — it
+implemented W8A8 — and is no longer targeted by the software toolchain.
 
 For the end-to-end accuracy benchmarks:
 
 ```bash
-./.venv/bin/python3 software/tools/benchmark_w8a32.py --max-images 20
 ./.venv/bin/python3 software/tools/benchmark_w8a16.py --max-images 20
+./.venv/bin/python3 software/tools/benchmark_w8a32.py --max-images 20
 ```
 
 W8A16 picks up most of the W8A32 accuracy at half the dequant-DRAM
 footprint — `cos vs FP32 ≥ 0.997`, `cos vs fake_quant ≥ 0.998`. See
-`docs/precision_modes.md` for the motivation behind the fork, the load-
-bearing accuracy gates, and the path forward (mixed precision / W4A8 /
-etc.).
+`docs/precision_modes.md` for the motivation behind W8A16 and the load-
+bearing accuracy gates.
 
 ## RTL Stack
 

@@ -15,7 +15,7 @@ torch>=2.0,<3
 # transformers 5.9.0 renamed ViT state_dict keys (vit.encoder.layer.X.* →
 # vit.layers.X.*, attention.attention.{query,key,value} → attention.{q,k,v}_proj,
 # intermediate.dense → mlp.fc1, output.dense → mlp.fc2). Our graph_extract,
-# seq_tiling pass, and the compile_w8a8/w8a32/w8a16 state-dict loops are wired
+# seq_tiling pass, and the compile_w8a16/w8a32 state-dict loops are wired
 # to the legacy names, so we pin below 5.9 until those call sites adopt a
 # remapping layer. See CI failure: tests/test_w8a{32,16}_compile.py KeyError on
 # 'vit.encoder.layer.0.layernorm_before.weight' under transformers 5.9.

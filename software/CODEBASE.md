@@ -16,11 +16,10 @@ A complete Python toolchain for an INT8 transformer accelerator targeting **face
 8. [Utilities — `taccel/utils/`](#utilities)
 9. [CLI Tools — `tools/`](#cli-tools)
 10. [Tests — `tests/`](#tests)
-11. [Accuracy Comparison — `tools/fake_quant_benchmark.py`](#accuracy-comparison)
-12. [Data Flow: end-to-end walkthrough](#data-flow-end-to-end)
-13. [Key Design Decisions](#key-design-decisions)
-14. [Quantization Results](#quantization-results)
-15. [Extending the Toolchain](#extending-the-toolchain)
+11. [Data Flow: end-to-end walkthrough](#data-flow-end-to-end)
+12. [Key Design Decisions](#key-design-decisions)
+13. [Quantization Results](#quantization-results)
+14. [Extending the Toolchain](#extending-the-toolchain)
 
 ---
 
@@ -41,84 +40,86 @@ transformer_accelerator/
 │   │   ├── assembler.py       # Two-pass assembler + ProgramBinary format
 │   │   └── disassembler.py    # ProgramBinary → annotated text assembly
 │   │
-│   ├── quantizer/             # INT8 weight & activation quantization
+│   ├── quantizer/             # INT8 weight quantization (no activation calib)
 │   │   ├── quantize.py        # Per-channel symmetric INT8 quantization
 │   │   ├── scales.py          # Scale propagation, bias pre-scaling
-│   │   ├── calibrate.py       # Forward-hook calibration of activation ranges
-│   │   └── fake_quant.py      # Fake-quantization + accuracy metrics
+│   │   └── fake_quant.py      # FP32 reference w/ per-channel weight quant
 │   │
 │   ├── compiler/              # IR, tiling, memory allocation, code generation
-│   │   ├── ir.py              # IRNode / IRGraph dataclasses
-│   │   ├── graph_extract.py   # DeiT-tiny → IRGraph (hard-coded)
-│   │   ├── tiler.py           # Tile schedules for systolic 16×16 matmuls
-│   │   ├── memory_alloc.py    # Dynamic SRAM allocator with eviction
-│   │   ├── codegen.py         # IRGraph → ISA instruction sequence
-│   │   └── compiler.py        # Top-level: model → ProgramBinary
+│   │   ├── ir.py                  # IRNode / IRGraph dataclasses
+│   │   ├── graph_extract.py       # ViT → IRGraph
+│   │   ├── tiler.py               # Tile schedules for systolic 16×16 matmuls
+│   │   ├── memory_alloc.py        # Dynamic SRAM allocator with eviction
+│   │   ├── codegen_w8a16.py       # W8A16 codegen (default)
+│   │   ├── codegen_w8a32.py       # W8A32 codegen
+│   │   ├── compiler.py            # Top-level: model → ProgramBinary
+│   │   └── passes/                # IR passes (seq tiling, memory estimate)
 │   │
 │   ├── golden_model/          # Bit-accurate hardware simulator
-│   │   ├── state.py           # MachineState (buffers, regs, PC, cycles)
-│   │   ├── memory.py          # SRAM read/write helpers with bounds checks
-│   │   ├── systolic.py        # INT8 16×16 tile matmul (Python int loops)
-│   │   ├── sfu.py             # LayerNorm / Softmax / GELU (FP32 internal)
-│   │   ├── dma.py             # DMA load/store + BUF_COPY with transpose
-│   │   └── simulator.py       # Fetch-decode-execute loop
+│   │   ├── state.py / state_w8a{16,32}.py    # MachineState + FP16/FP32 views
+│   │   ├── memory.py                          # SRAM read/write helpers
+│   │   ├── systolic_w8a{16,32}.py             # FP16/FP32 matmul
+│   │   ├── sfu_w8a{16,32}.py                  # LayerNorm / Softmax / GELU
+│   │   ├── dma.py                             # DMA load/store + BUF_COPY
+│   │   └── simulator_w8a{16,32}.py            # Fetch-decode-execute loop
 │   │
 │   └── utils/
 │       ├── int8_ops.py        # clip_int8, clip_int32, saturating add
 │       └── tensor_utils.py    # pad_to_multiple, tiles_for_dim, tile_coords
 │
-├── tools/                     # All user-facing CLIs live here (no scripts at root)
+├── tools/                     # All user-facing CLIs live here
 │   ├── asm.py                       # .asm → .bin
 │   ├── disasm.py                    # .bin → .asm
 │   ├── compile_model.py             # pytorch_model.bin → program.bin
 │   ├── run_golden.py                # simulate program.bin
-│   ├── compare_rtl_golden.py        # one-image RTL vs golden compare
-│   ├── batch_compare_rtl_golden.py  # batch driver for the above
-│   ├── benchmark_fp32_vs_int8.py    # FP32 vs INT8 golden benchmark (was compare_golden.py)
-│   ├── diagnose_block_ranges.py     # per-block range diagnostics (was diagnose_accuracy.py)
-│   ├── fake_quant_benchmark.py      # FP32 vs INT8 fake-quant baseline (was compare_accuracy.py)
+│   ├── benchmark_w8a16.py           # W8A16 end-to-end accuracy
+│   ├── benchmark_w8a32.py           # W8A32 end-to-end accuracy
+│   ├── profile_memory.py            # ABUF/WBUF/ACCUM peak footprint reporter
 │   ├── export_model_asm.py          # dump assembly for a named preset
 │   └── extract_qkt_replay.py        # build a Q·K^T replay payload bundle
 │
 └── tests/
-    ├── test_isa_encoding.py   # Encode/decode round-trips, all 17 types
-    ├── test_assembler.py      # Assemble → disassemble → assemble identity
-    ├── test_quantizer.py      # Quantize/dequant error ≤ 1 LSB, bias scaling
-    ├── test_golden_model.py   # Per-instruction simulation with known vectors
-    ├── test_tiler.py          # Tile coverage, QKT pad-transpose, accumulate flag
-    ├── test_compiler.py       # Memory allocator, capacity constraints
-    └── test_mlp_strip_mining.py  # FC1 strip-mine peak ABUF ≤ 128 KB
+    ├── test_isa_encoding.py             # Encode/decode round-trips
+    ├── test_assembler.py                # Assemble → disassemble identity
+    ├── test_quantizer.py                # Quantize/dequant + W8A16/W8A32 entry points
+    ├── test_tiler.py                    # Tile coverage, QKT pad-transpose
+    ├── test_w8a16_{foundation,simulator,compile}.py   # W8A16 path
+    ├── test_w8a32_{foundation,simulator,compile}.py   # W8A32 path
+    └── test_vit_base_compile.py         # ViT-B compile + M2/M3 boundaries
 ```
 
 ### Precision-modes parallel layout
 
-The compiler and golden simulator support three precision modes — `w8a8`
-(production / RTL-matched), `w8a32` (software-only FP32 accuracy ceiling),
-and `w8a16` (software-only FP16 middle path). All three are implemented
-as **parallel modules** that sit beside each other; the production W8A8
-files are never edited to add FP behaviour, and the W8A32 files are not
-edited to add W8A16.
+The compiler and golden simulator support two precision modes — `w8a16`
+(default, shipping) and `w8a32` (FP32 weight-quant ceiling reference).
+Both are software-only and implemented as **parallel modules** that sit
+beside each other; the W8A32 files are never edited to add W8A16
+behaviour and vice versa.
 
-| W8A8 path | W8A32 path | W8A16 path |
-|---|---|---|
-| `compiler/codegen.py` | `compiler/codegen_w8a32.py` | `compiler/codegen_w8a16.py` |
-| `compiler/passes/memory_estimate.py` | `compiler/passes/memory_estimate_w8a32.py` | `compiler/passes/memory_estimate_w8a16.py` |
-| `golden_model/simulator.py` | `golden_model/simulator_w8a32.py` | `golden_model/simulator_w8a16.py` |
-| `golden_model/sfu.py` | `golden_model/sfu_w8a32.py` | `golden_model/sfu_w8a16.py` |
-| `golden_model/systolic.py` | `golden_model/systolic_w8a32.py` | `golden_model/systolic_w8a16.py` |
-| `golden_model/state.py::MachineState` | `golden_model/state_w8a32.py::MachineStateW8A32` | `golden_model/state_w8a16.py::MachineStateW8A16` |
-| `Compiler.compile()` | `Compiler(mode='w8a32').compile_w8a32()` | `Compiler(mode='w8a16').compile_w8a16()` |
-| `tools/benchmark_fp32_vs_int8.py` | `tools/benchmark_w8a32.py` | `tools/benchmark_w8a16.py` |
-| `tools/batch_compare_rtl_golden.py` | (RTL parity suspended) | (RTL parity suspended) |
+| W8A16 path (default) | W8A32 path |
+|---|---|
+| `compiler/codegen_w8a16.py` | `compiler/codegen_w8a32.py` |
+| `compiler/passes/memory_estimate_w8a16.py` | `compiler/passes/memory_estimate_w8a32.py` |
+| `golden_model/simulator_w8a16.py` | `golden_model/simulator_w8a32.py` |
+| `golden_model/sfu_w8a16.py` | `golden_model/sfu_w8a32.py` |
+| `golden_model/systolic_w8a16.py` | `golden_model/systolic_w8a32.py` |
+| `golden_model/state_w8a16.py::MachineStateW8A16` | `golden_model/state_w8a32.py::MachineStateW8A32` |
+| `Compiler(mode='w8a16').compile_w8a16()` | `Compiler(mode='w8a32').compile_w8a32()` |
+| `tools/benchmark_w8a16.py` | `tools/benchmark_w8a32.py` |
 
-Activation-calibration modules (`quantizer/calibrate.py`,
-`smooth_quant.py`, `hessian_guided.py`, `twin_uniform.py`,
-`bias_correction.py`) are dormant on both FP paths — they only run on
-W8A8 inference. The canonical weight-quant entry points are
-`quantizer.W8A32_QUANTIZE` and `quantizer.W8A16_QUANTIZE`, both aliases
-for per-channel symmetric INT8 (the activation precision does not affect
-the weight-side scheme). See `docs/precision_modes.md` for the full
-motivation, accuracy gates, and architectural differences.
+The canonical weight-quant entry points are `quantizer.W8A16_QUANTIZE`
+and `quantizer.W8A32_QUANTIZE` (the latter is an alias for the former —
+the activation precision does not affect the weight-side scheme; both
+are per-channel symmetric INT8). The legacy W8A8 INT8-activations path
+and its calibration plumbing (smooth_quant, hessian_guided, twin_uniform,
+bias_correction, calibrate) were removed; see `docs/precision_modes.md`
+for the rationale, accuracy gates, and architectural differences.
+
+The base classes in `golden_model/{simulator,state,sfu,systolic}.py`
+remain as internal infrastructure: `SimulatorW8A16` / `SimulatorW8A32`
+inherit from `Simulator` for the byte-mover (LOAD/STORE/BUF_COPY) and
+control-flow (CONFIG_TILE/SYNC/HALT) ops, all of which are mode-agnostic.
+The mode-specific subclasses override the math ops.
 
 ---
 
@@ -334,27 +335,17 @@ Maintains a `{name: scale}` registry and provides:
 
 ---
 
-### `taccel/quantizer/calibrate.py` — `CalibrationResult`
-
-`calibrate_model(model, sample_inputs)`:
-1. Registers `register_forward_hook` on every leaf module
-2. Runs forward passes on each sample input
-3. Records `max(abs(output))` per module
-4. Returns `CalibrationResult` with `scales = {name: max_abs / 127}`
-
-The `add_observation` method keeps a running max so multiple batches can be processed incrementally.
-
----
-
 ### `taccel/quantizer/fake_quant.py`
 
-Simulates INT8 inference inside the normal PyTorch forward pass by patching weights and optionally hooking activations. Used exclusively by `tools/fake_quant_benchmark.py`.
+Provides a PyTorch-side reference for the per-channel INT8 weight-quant
+scheme so the W8A16 / W8A32 benchmarks can compute the fake-quant
+ceiling without running the simulator.
 
-**`apply_weight_quantization(model)`** — deep-copies the model, then for every `nn.Linear` / `nn.Conv2d` calls `_quantize_dequantize_weight`: quantize to INT8 with our exact scheme, immediately dequantize to FP32, replace `module.weight.data`. The resulting model runs normal FP32 arithmetic but with weight values constrained to the INT8 grid.
-
-**`calibrate_activation_scales(model, inputs)`** — forward-hooks every Linear/Conv2d/LayerNorm, records 99.99th-percentile of `abs(output)`, returns `{name: scale}`.
-
-**`ActivationQuantizer`** — attaches hooks that quantize each activation tensor to INT8 and immediately dequantize back, simulating the quantization error that would occur on hardware.
+**`apply_weight_quantization(model)`** — deep-copies the model, then for
+every `nn.Linear` / `nn.Conv2d` runs the per-channel INT8 quantize →
+dequantize loop in-place. The resulting model runs normal FP32 forward
+with weight values constrained to the INT8 grid; this is the upper
+bound on accuracy that any weight-only INT8 scheme can hit.
 
 **`compute_metrics(logits_fp32, logits_q)`** — returns:
 - `top1_match` / `top5_match`
@@ -760,33 +751,6 @@ Round-trip `encode → decode → re-encode` for:
 
 ---
 
-## Accuracy Comparison
-
-### `tools/fake_quant_benchmark.py`
-
-Tests the accuracy impact of our quantization scheme using **fake quantization** (quantize weights → dequantize back to FP32, then run normal PyTorch inference). Two experiments:
-
-**Experiment 1 — Weight-only (W8)**: Only the 74 Linear/Conv2d weight tensors are quantized. Activations stay FP32. This is the lower bound on quantization error.
-
-**Experiment 2 — Weight + activation (W8A8)**: After weight quantization, forward-hooks quantize and dequantize every activation tensor using calibrated per-module scales. This simulates what the hardware actually computes.
-
-Results on 10 images (5 real COCO, 5 synthetic random):
-
-| Metric | W8 (weight-only) | W8A8 (weight + act) |
-|--------|-----------------|---------------------|
-| Weight SNR | 46.4 dB | — |
-| Top-1 preserved | **100%** | 50% (100% on real, 0% on random) |
-| Top-5 preserved | **100%** | 50% |
-| Logit cosine sim | **0.9988** | 0.77 |
-| Logit SNR | **26.7 dB** | 3.3 dB |
-| Softmax KL div | **0.00056 nats** | 0.12 nats |
-
-The W8 result is excellent — per-channel weight quantization introduces effectively zero accuracy loss. The W8A8 degradation on random images is a calibration issue (scales were calibrated on the same 10 images), not a fundamental flaw in the quantization scheme. With a proper ImageNet calibration set (128+ diverse images), W8A8 accuracy would match published INT8 DeiT results (~72% vs 72.2% FP32 top-1 on ImageNet).
-
-Results are saved to `quantization_comparison.json`.
-
----
-
 ## Data Flow: End-to-End
 
 ```
@@ -890,6 +854,8 @@ All weight matrices use **per-channel** scales (one scale per output channel). T
 3. Verify that `tile_matmul`, `memory_alloc`, and `codegen` handle the new layer shapes (BERT uses 768-dim, 12 heads, head_dim=64 — all multiples of 16, so no new padding logic is needed)
 4. If a new op type is required, follow the instruction addition steps above
 
-**Improving calibration**:
-- Replace `calibrate.py`'s per-module max with a moving average over a 128-image ImageNet subset for W8A8 accuracy within 0.5% of FP32
-- Consider GPTQ-style learned weight quantization (`taccel/quantizer/gptq.py`) for sensitive layers (embedding projection, classifier head)
+**Improving accuracy beyond the weight-quant ceiling**:
+- Per-channel learned weight rounding (GPTQ / AdaRound) for sensitive
+  layers (embedding projection, classifier head)
+- Smaller weight dtype (W4A16) at the cost of per-channel scale tables
+  growing in the DRAM dequant blob
