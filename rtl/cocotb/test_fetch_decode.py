@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from utils.dram_model import DramModel
 from utils.insn_builder import (
     NOP, HALT, SYNC, CONFIG_TILE, SET_SCALE, SET_ADDR_LO, SET_ADDR_HI,
-    LOAD, MATMUL, ILLEGAL_OP, BUF_COPY, REQUANT_PC, SCALE_MUL, DEQUANT_ADD, SOFTMAX_ATTNV,
+    LOAD, MATMUL, ILLEGAL_OP, BUF_COPY,
+    REQUANT, REQUANT_PC, SCALE_MUL, DEQUANT_ADD, SOFTMAX_ATTNV,
     BUF_ABUF, BUF_WBUF, BUF_ACCUM
 )
 
@@ -230,6 +231,23 @@ async def test_scale_mul_dispatch_no_fault(dut):
     done, fault, _, _ = await run_program(dut, dram, prog, timeout_cycles=20000)
     assert done == 1
     assert fault == 0
+
+
+@cocotb.test()
+async def test_requant_unsupported(dut):
+    """REQUANT (0x0B) was dropped in W8A16 — must raise FAULT_UNSUPPORTED_OP
+    at decode/control (Phase 5), before reaching the helper engine."""
+    dram, _ = await init_dut(dut)
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        SET_SCALE(0, 0x3C00),
+        REQUANT(BUF_ACCUM, 0, BUF_ABUF, 0, sreg=0, flags=0),
+        HALT(),
+    ]
+    done, fault, fault_code, _ = await run_program(dut, dram, prog, timeout_cycles=20000)
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
 
 
 @cocotb.test()

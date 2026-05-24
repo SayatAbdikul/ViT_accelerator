@@ -203,14 +203,14 @@ static void test_illegal_opcode() {
 }
 
 // ============================================================================
-// Test: W8A16 surviving paths halt cleanly; dropped Stage E opcodes raise
-// FAULT_UNSUPPORTED_OP.
+// Test: W8A16 surviving paths halt cleanly; dropped INT8-bridging opcodes
+// raise FAULT_UNSUPPORTED_OP at decode/control.
 //
-// In the W8A8 era, REQUANT_PC / DEQUANT_ADD / SOFTMAX_ATTNV were valid
-// helper/SFU dispatches. The W8A16 fork drops them — they remain legal ISA
-// encodings but are rejected with FAULT_UNSUPPORTED_OP (code 6) by the
-// helper engine (Phase 4) and SFU (Phase 3). Phase 5 will hoist the
-// rejection into decode_unit; until then the engines themselves catch it.
+// In the W8A8 era, REQUANT / REQUANT_PC / DEQUANT_ADD / SOFTMAX_ATTNV were
+// valid helper/SFU dispatches. The W8A16 fork drops them — they remain legal
+// ISA encodings but Phase 5 routes them through decode_unit's `illegal`
+// signal into FAULT_UNSUPPORTED_OP (code 6); the helper engine (Phase 4) and
+// SFU (Phase 3) still hold defensive fallbacks but are no longer reached.
 // ============================================================================
 static void test_w8a16_dispatch_paths() {
     // SCALE_MUL ACCUM -> ACCUM is the in-place scale path used by codegen
@@ -229,6 +229,12 @@ static void test_w8a16_dispatch_paths() {
         EXPECT(s.dut->fault == 0, "scale_mul ACCUM->ACCUM should not fault");
         TEST_PASS(name);
     }
+
+    expect_fault_program("requant_unsupported",
+        { insn::CONFIG_TILE(1, 1, 1),
+          insn::SET_SCALE(0, 0x3C00),
+          insn::REQUANT(2, 0, 0, 0, 0),
+          insn::HALT() }, 6, 5000);
 
     expect_fault_program("requant_pc_unsupported",
         { insn::CONFIG_TILE(1, 1, 1),

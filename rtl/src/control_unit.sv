@@ -192,11 +192,24 @@ module control_unit
             fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
           end else if (insn.illegal) begin
-            fault_code_r <= (insn.opcode > 5'h13) ?
-                             4'(FAULT_ILLEGAL_OP) : 4'(FAULT_BAD_BUF);
+            // decode raises `illegal` for three disjoint cases; pick the matching
+            // architectural fault code based on the opcode value:
+            //   opcode > 0x13               → FAULT_ILLEGAL_OP   (reserved encoding)
+            //   opcode in {0x0B,0x11,0x12,0x13} → FAULT_UNSUPPORTED_OP
+            //                                 (W8A16-dropped INT8-bridging ops)
+            //   else                        → FAULT_BAD_BUF      (buf_id = 2'b11)
+            // The opcode-precedence here matches decode_unit.sv's bit OR.
+            logic [3:0] ill_code;
+            if (insn.opcode > 5'h13)
+              ill_code = 4'(FAULT_ILLEGAL_OP);
+            else if (insn.opcode == 5'h0B || insn.opcode == 5'h11 ||
+                     insn.opcode == 5'h12 || insn.opcode == 5'h13)
+              ill_code = 4'(FAULT_UNSUPPORTED_OP);
+            else
+              ill_code = 4'(FAULT_BAD_BUF);
+            fault_code_r          <= ill_code;
             obs_ctrl_fault_pulse  <= 1'b1;
-            obs_ctrl_fault_code   <= (insn.opcode > 5'h13) ?
-                                     4'(FAULT_ILLEGAL_OP) : 4'(FAULT_BAD_BUF);
+            obs_ctrl_fault_code   <= ill_code;
             obs_ctrl_fault_pc     <= pc_reg;
             obs_ctrl_fault_opcode <= insn.opcode;
             state        <= S_FAULT;
@@ -293,11 +306,11 @@ module control_unit
                 end
               end
 
-              OP_REQUANT,
-              OP_REQUANT_PC,
+              // OP_REQUANT (0x0B), OP_REQUANT_PC (0x11), and OP_DEQUANT_ADD
+              // (0x13) are unsupported in W8A16 and fault at decode (see
+              // `insn.illegal` branch above); they never reach this case.
               OP_SCALE_MUL,
-              OP_VADD,
-              OP_DEQUANT_ADD: begin
+              OP_VADD: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   obs_ctrl_fault_pulse  <= 1'b1;
@@ -338,8 +351,9 @@ module control_unit
               // Stage D SFU ops are architecturally asynchronous. Dispatch once
               // the serialized Stage D resource slot is clear, then advance PC
               // immediately and rely on SYNC(100) for ordering.
+              // OP_SOFTMAX_ATTNV (0x12) is unsupported in W8A16 and faults at
+              // decode (see `insn.illegal` branch above); it never reaches here.
               OP_SOFTMAX,
-              OP_SOFTMAX_ATTNV,
               OP_LAYERNORM,
               OP_GELU: begin
                 if (!tile_valid) begin
@@ -475,10 +489,13 @@ module control_unit
             OP_BUF_COPY:
               helper_dispatch = helper_ready_now;
 
-            OP_REQUANT, OP_REQUANT_PC, OP_SCALE_MUL, OP_VADD, OP_DEQUANT_ADD:
+            // OP_REQUANT/OP_REQUANT_PC/OP_DEQUANT_ADD (W8A16-dropped) fault at
+            // decode and never reach S_ISSUE's dispatch path.
+            OP_SCALE_MUL, OP_VADD:
               helper_dispatch = tile_valid && helper_ready_now;
 
-            OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU:
+            // OP_SOFTMAX_ATTNV (W8A16-dropped) faults at decode.
+            OP_SOFTMAX, OP_LAYERNORM, OP_GELU:
               sfu_dispatch = tile_valid && sfu_ready_now;
 
             default: ;

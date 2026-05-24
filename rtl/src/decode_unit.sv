@@ -5,10 +5,11 @@
 // fields to use based on insn.opcode.
 //
 // Bit positions match software/taccel/isa/encoding.py exactly.
-// The single `insn.illegal` bit intentionally collapses two cases:
-//   - reserved opcode
-//   - reserved buffer ID inside a legal format
-// The control unit maps those to the architectural fault code later.
+// The single `insn.illegal` bit intentionally collapses three cases:
+//   - reserved opcode (0x14–0x1F)            → FAULT_ILLEGAL_OP
+//   - unsupported opcode (0x0B/0x11/0x12/0x13 in W8A16) → FAULT_UNSUPPORTED_OP
+//   - reserved buffer ID (2'b11) in a supported format → FAULT_BAD_BUF
+// The control unit demultiplexes these into the architectural fault code.
 
 `ifndef DECODE_UNIT_SV
 `define DECODE_UNIT_SV
@@ -33,6 +34,26 @@ module decode_unit
   // -------------------------------------------------------------------------
   logic illegal_opcode;
   assign illegal_opcode = (opcode_raw > 5'h13);
+
+  // -------------------------------------------------------------------------
+  // Unsupported opcodes: legal ISA encodings the W8A16 RTL does not implement.
+  // The W8A16 software contract (codegen_w8a16.py) never emits these, but the
+  // ISA reserves the encodings for any future RTL that re-adds an INT8 path.
+  //   OP_REQUANT       0x0B
+  //   OP_REQUANT_PC    0x11
+  //   OP_SOFTMAX_ATTNV 0x12
+  //   OP_DEQUANT_ADD   0x13
+  // The control unit demultiplexes `insn.illegal` into FAULT_UNSUPPORTED_OP
+  // (this set), FAULT_ILLEGAL_OP (reserved 0x14–0x1F), or FAULT_BAD_BUF
+  // (reserved buffer ID inside a supported format).
+  // -------------------------------------------------------------------------
+  logic unsupported_opcode;
+  always_comb begin
+    unique case (opcode_raw)
+      5'h0B, 5'h11, 5'h12, 5'h13: unsupported_opcode = 1'b1;
+      default:                    unsupported_opcode = 1'b0;
+    endcase
+  end
 
   // -------------------------------------------------------------------------
   // Illegal buffer ID check (R-type, M-type, B-type only).
@@ -96,7 +117,7 @@ module decode_unit
   always_comb begin
     // Common
     insn.opcode  = opcode_raw;
-    insn.illegal = illegal_opcode | illegal_buf;
+    insn.illegal = illegal_opcode | illegal_buf | unsupported_opcode;
 
     // R-type fields
     insn.src1_buf = insn_data[58:57];
