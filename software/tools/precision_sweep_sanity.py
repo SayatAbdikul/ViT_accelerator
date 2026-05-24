@@ -2,7 +2,7 @@
 """W32A32 sanity check — proves fp32 inference is deterministic.
 
 If this returns cosine != 1.0 (within float epsilon), the comparison rig
-itself is broken and any W8A32 / W8A8 number we collect later is suspect.
+itself is broken and any W8A16 / W8A32 number we collect later is suspect.
 
 Not committed; standalone tool.
 """

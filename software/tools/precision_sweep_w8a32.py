@@ -5,12 +5,6 @@ Measures the *ceiling* of weight-only quantization on DeiT-tiny:
 how much logit signal is lost purely to weight rounding when
 activations remain at full precision.
 
-Compares against the user's 0.83 / 90% / 72% W8A8 baseline.
-- If W8A32 cosine ≈ 0.99+, the W8A8 0.83 deficit is dominated by
-  activation quant.
-- If W8A32 cosine ≪ 1, weight quant itself is leaking signal —
-  per-channel scales help but aren't enough; AdaRound / clipping needed.
-
 Self-contained: bypasses AutoImageProcessor (no torchvision dep) and
 downloads a handful of COCO val2017 images directly.
 Not committed; diagnostic only.
@@ -151,9 +145,6 @@ def main() -> int:
     print(f"    cosine_sim min : {float(arr.min()):.4f}")
     print(f"    top-1 agreement: {top1_match}/{n} ({100.0 * top1_match / n:.0f}%)")
     print(f"    top-5 overlap  : {float(ov_arr.mean()) * 100:.0f}%")
-    print()
-    print(f"  Baseline W8A8 (per user): 0.83 / 90% top-1 / 72% top-5")
-    print(f"  Gap attributable to ACTIVATION quant = W8A32 minus W8A8 numbers")
     return 0
 
 

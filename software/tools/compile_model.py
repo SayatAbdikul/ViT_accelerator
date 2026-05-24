@@ -3,43 +3,19 @@
 
 Supports two precision modes via ``--mode``:
 
-* ``w8a8`` (default) — INT8 weights, INT8 activations, the production /
-  RTL-matched path. Honors activation calibration and the experimental
-  GELU/REQUANT_PC flags.
-* ``w8a32`` — INT8 weights (per-channel) dequantized into FP32 DRAM,
-  FP32 activations, FP32 accumulators. Software-only — RTL parity is
-  suspended in this mode. Used to measure the weight-only accuracy
-  ceiling end-to-end through the real compiler + golden simulator.
-  Calibration and all REQUANT_PC / GELU-from-ACCUM flags are ignored
-  (they have no meaning when there is no INT8 bridge to fuse across).
+* ``w8a16`` (default) — INT8 weights (per-channel) dequantized into FP16
+  DRAM, FP16 activations, FP32 accumulators. Shipping mode.
+* ``w8a32`` — INT8 weights (per-channel) dequantized into FP32 DRAM, FP32
+  activations, FP32 accumulators. Software-only weight-quant ceiling
+  reference; doubles the dequant-weight DRAM footprint vs w8a16.
 """
 import argparse
 import sys
 import os
-from typing import List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MODEL_NAME = "facebook/deit-tiny-patch16-224"
-
-
-def build_calibration(model_name: str, state_dict: dict, image_paths: List[str]):
-    """Load a DeiT model and calibrate it on local image files."""
-    from PIL import Image
-    from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification
-    from taccel.quantizer.calibrate import calibrate_model
-
-    config = AutoConfig.from_pretrained(model_name)
-    model = AutoModelForImageClassification.from_config(config)
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    processor = AutoImageProcessor.from_pretrained(model_name)
-
-    sample_inputs = []
-    for path in image_paths:
-        with Image.open(path) as img:
-            sample_inputs.append(processor(images=img.convert("RGB"), return_tensors="pt"))
-    return calibrate_model(model, sample_inputs)
 
 
 def main():
@@ -48,31 +24,13 @@ def main():
     parser.add_argument("--model", default="deit-tiny",
                         choices=["deit-tiny"], help="Model architecture")
     parser.add_argument("-o", "--output", default="program.bin", help="Output .bin file")
-    parser.add_argument("--calibration-images", nargs="*",
-                        help="Image files for calibration (optional)")
-    parser.add_argument(
-        "--gelu-from-accum",
-        action="store_true",
-        help="Enable the experimental GELU-from-ACCUM codegen path",
-    )
-    parser.add_argument(
-        "--requant-pc-qkv",
-        action="store_true",
-        help="Enable the experimental REQUANT_PC path for per-head Q/K/V projections",
-    )
-    parser.add_argument(
-        "--requant-pc-out-proj",
-        action="store_true",
-        help="Enable the experimental REQUANT_PC path for out_proj matmuls",
-    )
     parser.add_argument(
         "--mode",
-        choices=["w8a8", "w8a32", "w8a16"],
-        default="w8a8",
-        help="Precision mode (see module docstring). w8a8 is the production / "
-             "RTL-matched path; w8a32 and w8a16 are software-only and bypass "
-             "activation calibration entirely. w8a16 halves the dequant DRAM "
-             "footprint vs w8a32 with a small additional FP16 rounding noise.",
+        choices=["w8a16", "w8a32"],
+        default="w8a16",
+        help="Precision mode (see module docstring). w8a16 is the default "
+             "shipping path; w8a32 doubles dequant DRAM but is the FP32 "
+             "weight-quant ceiling reference.",
     )
     args = parser.parse_args()
 
@@ -86,37 +44,13 @@ def main():
     from taccel.model_config import ModelConfig
 
     if args.mode == "w8a32":
-        if args.calibration_images:
-            print("[w8a32] ignoring --calibration-images (no activation quant in this mode)")
-        if args.gelu_from_accum or args.requant_pc_qkv or args.requant_pc_out_proj:
-            print("[w8a32] ignoring --gelu-from-accum / --requant-pc-* (no INT8 bridge to fuse across)")
         print(f"Compiling {args.model} in W8A32 mode...")
         compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a32")
         prog = compiler.compile_w8a32(state_dict)
-    elif args.mode == "w8a16":
-        if args.calibration_images:
-            print("[w8a16] ignoring --calibration-images (no activation quant in this mode)")
-        if args.gelu_from_accum or args.requant_pc_qkv or args.requant_pc_out_proj:
-            print("[w8a16] ignoring --gelu-from-accum / --requant-pc-* (no INT8 bridge to fuse across)")
+    else:
         print(f"Compiling {args.model} in W8A16 mode...")
         compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a16")
         prog = compiler.compile_w8a16(state_dict)
-    else:
-        calibration = None
-        if args.calibration_images:
-            print(f"Calibrating on {len(args.calibration_images)} image(s)...")
-            calibration = build_calibration(MODEL_NAME, state_dict, args.calibration_images)
-            print(f"  Collected {len(calibration.scales)} activation scales")
-
-        print(f"Compiling {args.model}...")
-        compiler = Compiler()
-        prog = compiler.compile(
-            state_dict,
-            calibration=calibration,
-            gelu_from_accum=args.gelu_from_accum,
-            requant_pc_qkv=args.requant_pc_qkv,
-            requant_pc_out_proj=args.requant_pc_out_proj,
-        )
 
     with open(args.output, 'wb') as f:
         f.write(prog.to_bytes())

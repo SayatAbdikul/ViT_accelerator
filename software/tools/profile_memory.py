@@ -11,9 +11,10 @@ Usage:
     python -m tools.profile_memory --model vit-base --mode w8a32
 
 Modes:
-    w8a8  — INT8 activations (1 byte/element); default.
+    w8a16 — FP16 activations (2 bytes/element); default (shipping mode).
     w8a32 — FP32 activations (4 bytes/element). ABUF capacity in *elements*
-            is 4× smaller and the M2 seq-tiling policy kicks in earlier.
+            is 2× smaller than w8a16, and the M2 seq-tiling policy kicks in
+            earlier.
 """
 from __future__ import annotations
 
@@ -26,9 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from taccel.isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE  # noqa: E402
 from taccel.model_config import ModelConfig  # noqa: E402
-from taccel.compiler.passes.memory_estimate import decide_seq_tiling  # noqa: E402
 from taccel.compiler.passes.memory_estimate_w8a32 import (  # noqa: E402
     decide_seq_tiling_w8a32,
+)
+from taccel.compiler.passes.memory_estimate_w8a16 import (  # noqa: E402
+    decide_seq_tiling_w8a16,
 )
 
 
@@ -46,7 +49,7 @@ def _bytes_pretty(n: int) -> str:
     return f"{n} B"
 
 
-def estimate_peak_abuf(cfg: ModelConfig, element_bytes: int = 1) -> dict:
+def estimate_peak_abuf(cfg: ModelConfig, element_bytes: int = 2) -> dict:
     """Estimate ABUF allocations in bytes for one transformer block.
 
     The codegen aggressively frees per-head sub-allocations and the strip-mined
@@ -54,8 +57,9 @@ def estimate_peak_abuf(cfg: ModelConfig, element_bytes: int = 1) -> dict:
     largest single allocation we attempt?* — if that exceeds the buffer cap,
     no amount of clever ordering will help.
 
-    ``element_bytes`` defaults to 1 (W8A8 INT8 activations). Pass 4 for the
-    W8A32 path (FP32 activations) — every estimate scales linearly.
+    ``element_bytes`` defaults to 2 (W8A16 FP16 activations, the shipping mode).
+    Pass 4 for the W8A32 path (FP32 activations) — every estimate scales
+    linearly.
     """
     embed = cfg.embed_dim
     seq = cfg.seq_len_pad
@@ -93,10 +97,10 @@ def estimate_weight_dram(cfg: ModelConfig) -> int:
     return per_block * cfg.depth + embedding + head
 
 
-_MODE_ELEMENT_BYTES = {"w8a8": 1, "w8a16": 2, "w8a32": 4}
+_MODE_ELEMENT_BYTES = {"w8a16": 2, "w8a32": 4}
 
 
-def report(cfg: ModelConfig, label: str, mode: str = "w8a8") -> None:
+def report(cfg: ModelConfig, label: str, mode: str = "w8a16") -> None:
     element_bytes = _MODE_ELEMENT_BYTES[mode]
     print(f"=== {label} ({mode}) ===")
     print(f"  embed_dim={cfg.embed_dim}  heads={cfg.num_heads}  head_dim={cfg.head_dim}")
@@ -117,10 +121,8 @@ def report(cfg: ModelConfig, label: str, mode: str = "w8a8") -> None:
     print()
     if mode == "w8a32":
         print(f"  Weight DRAM footprint (FP32 dequant): {_bytes_pretty(wbuf_dram * 4)}")
-    elif mode == "w8a16":
-        print(f"  Weight DRAM footprint (FP16 dequant): {_bytes_pretty(wbuf_dram * 2)}")
     else:
-        print(f"  Weight DRAM footprint (INT8): {_bytes_pretty(wbuf_dram)}")
+        print(f"  Weight DRAM footprint (FP16 dequant): {_bytes_pretty(wbuf_dram * 2)}")
     print(f"  WBUF capacity (streams from DRAM): {_bytes_pretty(WBUF_SIZE)}")
     print(f"  ACCUM capacity: {_bytes_pretty(ACCUM_SIZE)}")
 
@@ -131,11 +133,8 @@ def report(cfg: ModelConfig, label: str, mode: str = "w8a8") -> None:
     # Report M2 sequence-tiling policy for the selected mode.
     if mode == "w8a32":
         decision = decide_seq_tiling_w8a32(cfg)
-    elif mode == "w8a16":
-        from taccel.compiler.passes.memory_estimate_w8a16 import decide_seq_tiling_w8a16  # noqa: E402
-        decision = decide_seq_tiling_w8a16(cfg)
     else:
-        decision = decide_seq_tiling(cfg)
+        decision = decide_seq_tiling_w8a16(cfg)
     if decision.needs_tiling:
         per_tile = decision.per_tile_bytes
         print(f"  → M2 seq tiling: tile={decision.tile_rows} rows × "
@@ -167,12 +166,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["w8a8", "w8a32", "w8a16"],
-        default="w8a8",
-        help="Precision mode. w8a8 = INT8 activations (1 byte/element); "
-             "w8a16 = FP16 (2 bytes/element); w8a32 = FP32 (4 bytes/element). "
-             "Higher element widths shrink the per-element ABUF capacity and "
-             "trigger sequence tiling earlier.",
+        choices=["w8a16", "w8a32"],
+        default="w8a16",
+        help="Precision mode. w8a16 = FP16 activations (2 bytes/element, "
+             "default shipping mode); w8a32 = FP32 (4 bytes/element). FP32 "
+             "halves the per-element ABUF capacity and triggers sequence "
+             "tiling earlier.",
     )
     args = parser.parse_args()
 
