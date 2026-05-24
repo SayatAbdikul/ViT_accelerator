@@ -120,6 +120,12 @@ def accum_row_u32x4(dut, row: int) -> list[int]:
 
 
 def read_accum_16x16(dut, dst_off: int = 0) -> list[list[int]]:
+    """Legacy INT32 ACCUM read (helper / SFU INT8 tests).
+
+    The W8A16 datapath writes FP32 bit patterns to the same SRAM slots;
+    new tests should use read_accum_fp32_16x16 instead. Retained while
+    the helper / SFU cocotb suites still target the INT8 helper engine.
+    """
     out = [[0 for _ in range(16)] for _ in range(16)]
     for i in range(16):
         for grp in range(4):
@@ -142,3 +148,29 @@ def read_accum_32x32(dut, dst_off: int = 0) -> list[list[int]]:
             u = lanes[lane]
             out[i][j] = u if u < (1 << 31) else (u - (1 << 32))
     return out
+
+
+def read_accum_fp32(dut, rows: int, cols: int, dst_off: int = 0):
+    """Return an FP32 numpy array of shape (rows, cols) from ACCUM SRAM.
+
+    Tile layout: row(i,j) lives at SRAM row = dst_off + i*(cols/4) + j/4,
+    lane = j%4. Bit pattern is interpreted as IEEE-754 binary32.
+    """
+    import numpy as np
+    out = np.zeros((rows, cols), dtype=np.float32)
+    grps_per_row = cols // 4
+    for i in range(rows):
+        for j in range(cols):
+            grp, lane = j // 4, j % 4
+            row = dst_off + i * grps_per_row + grp
+            lanes = accum_row_u32x4(dut, row)
+            out[i, j] = np.array(lanes[lane], dtype=np.uint32).view(np.float32)
+    return out
+
+
+def read_accum_fp32_16x16(dut, dst_off: int = 0):
+    return read_accum_fp32(dut, 16, 16, dst_off)
+
+
+def read_accum_fp32_32x32(dut, dst_off: int = 0):
+    return read_accum_fp32(dut, 32, 32, dst_off)

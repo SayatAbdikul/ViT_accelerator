@@ -1,12 +1,21 @@
-// Unit-level chained systolic-array tests.
+// Unit-level chained systolic-array tests (W8A16 datapath).
+//
+// The systolic_array module now takes 256-bit a/b_row_data ports holding
+// 16 FP16 lanes each. Each PE widens FP16 to FP32 and accumulates an FP32
+// MAC (RNE FP32 mul, RNE FP32 add -- NOT a fused FMA).  This test drives
+// the array directly and checks the FP32 accumulator bit-by-bit against
+// a C++ reference doing the same widen/mul/add sequence on standard
+// IEEE-754 binary32 floats (which is RNE on default compiler flags).
 
 #include "Vsystolic_array.h"
 #include "verilated.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 
 static int tests_run = 0;
@@ -26,14 +35,116 @@ constexpr int SYS_DIM = 16;
 constexpr int CHAIN_FLUSH_CYCLES = 2 * (SYS_DIM - 1);
 constexpr int CHAIN_TOTAL_STEPS = SYS_DIM + CHAIN_FLUSH_CYCLES;
 
-using Row = std::array<int8_t, SYS_DIM>;
-using AccMatrix = std::array<std::array<int32_t, SYS_DIM>, SYS_DIM>;
+using Row = std::array<uint16_t, SYS_DIM>;          // 16 FP16 lanes
+using AccMatrix = std::array<std::array<uint32_t, SYS_DIM>, SYS_DIM>;  // FP32 bit patterns
 
+inline uint32_t float_bits(float f) {
+  uint32_t b;
+  std::memcpy(&b, &f, sizeof(b));
+  return b;
+}
+
+inline float bits_float(uint32_t b) {
+  float f;
+  std::memcpy(&f, &b, sizeof(f));
+  return f;
+}
+
+// FP16 -> FP32 widen matching fp32_from_fp16_bits in fp32_prim_pkg.sv:
+// finite values widen exactly; FP16 inf/NaN clamps to FP32 +/-65504.
+// We only use finite normal FP16 in these tests so the clamp path is
+// untouched; the helper is still written for completeness.
+float fp16_to_fp32(uint16_t h) {
+  uint32_t sign = (uint32_t(h) >> 15) & 0x1;
+  uint32_t exp5 = (uint32_t(h) >> 10) & 0x1F;
+  uint32_t frac10 = uint32_t(h) & 0x3FF;
+  uint32_t out;
+  if (exp5 == 0 && frac10 == 0) {
+    out = sign << 31;
+  } else if (exp5 == 0) {
+    // Subnormal: value = frac10 * 2^-24.
+    int k = 9;
+    while ((frac10 & (1u << k)) == 0) --k;
+    uint32_t mant = (frac10 - (1u << k)) << (23 - k);
+    uint32_t exp32 = uint32_t(k + 103);
+    out = (sign << 31) | (exp32 << 23) | mant;
+  } else if (exp5 == 0x1F) {
+    // FP16 inf/NaN -> FP32 +/-65504.
+    out = sign ? 0xC77FE000u : 0x477FE000u;
+  } else {
+    // Normal FP16 -> normal FP32: exp += 112, frac << 13.
+    uint32_t exp32 = exp5 + 112;
+    uint32_t mant = frac10 << 13;
+    out = (sign << 31) | (exp32 << 23) | mant;
+  }
+  return bits_float(out);
+}
+
+// FP32 -> FP16 with RNE matching fp32_to_fp16_bits in fp32_prim_pkg.sv
+// (used only for building input vectors from floats).
+uint16_t fp32_to_fp16(float f) {
+  uint32_t b = float_bits(f);
+  uint32_t sign = (b >> 31) & 0x1;
+  uint32_t exp8 = (b >> 23) & 0xFF;
+  uint32_t frac23 = b & 0x7FFFFF;
+
+  if (exp8 == 0xFF) {
+    if (frac23 != 0) return uint16_t((sign << 15) | (0x1F << 10) | 0x200);
+    return uint16_t((sign << 15) | (0x1F << 10));
+  }
+  if (exp8 == 0 || (exp8 < 113)) {
+    if (exp8 == 0) return uint16_t(sign << 15);
+    int e_unb = int(exp8) - 127;
+    if (e_unb < -24) return uint16_t(sign << 15);
+    uint32_t mant24 = (1u << 23) | frac23;
+    int rshift = 13 + (-14 - e_unb);
+    uint64_t val = uint64_t(mant24);
+    uint32_t lost_mask = (1u << rshift) - 1;
+    uint64_t lost = val & lost_mask;
+    uint64_t half = uint64_t(1) << (rshift - 1);
+    uint64_t rounded = val >> rshift;
+    bool tie = (lost == half);
+    if (lost > half || (tie && (rounded & 1))) rounded += 1;
+    if (rounded == 0x400) return uint16_t((sign << 15) | (1 << 10));
+    return uint16_t((sign << 15) | uint16_t(rounded));
+  }
+  int e_unb = int(exp8) - 127;
+  if (e_unb > 15) return uint16_t((sign << 15) | (0x1F << 10));
+  uint32_t mant24 = (1u << 23) | frac23;
+  int rshift = 13;
+  uint32_t lost_mask = (1u << rshift) - 1;
+  uint32_t lost = mant24 & lost_mask;
+  uint32_t half = 1u << (rshift - 1);
+  uint32_t rounded = mant24 >> rshift;
+  bool tie = (lost == half);
+  if (lost > half || (tie && (rounded & 1))) rounded += 1;
+  uint16_t exp5_out;
+  uint16_t frac10_out;
+  if (rounded == 0x800) {
+    exp5_out = uint16_t(e_unb + 15 + 1);
+    frac10_out = 0;
+  } else {
+    exp5_out = uint16_t(e_unb + 15);
+    frac10_out = uint16_t(rounded & 0x3FF);
+  }
+  if (exp5_out >= 0x1F) return uint16_t((sign << 15) | (0x1F << 10));
+  return uint16_t((sign << 15) | (exp5_out << 10) | frac10_out);
+}
+
+// Build an FP16 row from a small-integer float row (exact representation).
+Row build_row(const std::array<float, SYS_DIM>& xs) {
+  Row r{};
+  for (int i = 0; i < SYS_DIM; ++i) r[i] = fp32_to_fp16(xs[i]);
+  return r;
+}
+
+// Reference model of the chained array: FP32 accumulators, FP16 forwarded
+// operands (held as uint16_t bit patterns, widened to FP32 inside the PE).
 struct ChainedArrayRef {
-  std::array<std::array<int8_t, SYS_DIM - 1>, SYS_DIM> a_skew{};
-  std::array<std::array<int8_t, SYS_DIM - 1>, SYS_DIM> b_skew{};
-  std::array<std::array<int8_t, SYS_DIM>, SYS_DIM> a_out{};
-  std::array<std::array<int8_t, SYS_DIM>, SYS_DIM> b_out{};
+  std::array<std::array<uint16_t, SYS_DIM - 1>, SYS_DIM> a_skew{};
+  std::array<std::array<uint16_t, SYS_DIM - 1>, SYS_DIM> b_skew{};
+  std::array<std::array<uint16_t, SYS_DIM>, SYS_DIM> a_out{};
+  std::array<std::array<uint16_t, SYS_DIM>, SYS_DIM> b_out{};
   AccMatrix acc{};
 
   void reset() {
@@ -53,8 +164,8 @@ struct ChainedArrayRef {
   void step(const Row& a_row, const Row& b_row, bool step_en, bool clear_acc) {
     Row a_edge{};
     Row b_edge{};
-    std::array<std::array<int8_t, SYS_DIM>, SYS_DIM> pe_a_in{};
-    std::array<std::array<int8_t, SYS_DIM>, SYS_DIM> pe_b_in{};
+    std::array<std::array<uint16_t, SYS_DIM>, SYS_DIM> pe_a_in{};
+    std::array<std::array<uint16_t, SYS_DIM>, SYS_DIM> pe_b_in{};
     auto next_a_out = a_out;
     auto next_b_out = b_out;
     auto next_acc = acc;
@@ -76,7 +187,12 @@ struct ChainedArrayRef {
         if (clear_acc) {
           next_acc[i][j] = 0;
         } else if (step_en) {
-          next_acc[i][j] = acc[i][j] + int32_t(pe_a_in[i][j]) * int32_t(pe_b_in[i][j]);
+          float a32 = fp16_to_fp32(pe_a_in[i][j]);
+          float b32 = fp16_to_fp32(pe_b_in[i][j]);
+          float prod = a32 * b32;
+          float acc_cur = bits_float(acc[i][j]);
+          float acc_new = acc_cur + prod;
+          next_acc[i][j] = float_bits(acc_new);
         }
       }
     }
@@ -107,20 +223,23 @@ struct ChainedArrayRef {
   }
 };
 
-void set_row_data(Vsystolic_array* dut, const Row& row, VlWide<4>& port) {
-  for (int word = 0; word < 4; ++word) {
+// Pack 16 FP16 lanes (256 bits) into the Verilator port. The DUT port is
+// declared as logic [SYS_DIM*16-1:0]; Verilator emits this as a VlWide
+// array of 32-bit words (lane 0 in the low bits).
+void set_row_data(const Row& row, VlWide<8>& port) {
+  for (int word = 0; word < 8; ++word) {
     uint32_t packed = 0;
-    for (int byte = 0; byte < 4; ++byte) {
-      int idx = word * 4 + byte;
-      packed |= uint32_t(uint8_t(row[idx])) << (8 * byte);
+    for (int half = 0; half < 2; ++half) {
+      int lane = word * 2 + half;
+      packed |= uint32_t(row[lane]) << (half * 16);
     }
     port[word] = packed;
   }
 }
 
 void drive_rows(Vsystolic_array* dut, const Row& a_row, const Row& b_row) {
-  set_row_data(dut, a_row, dut->a_row_data);
-  set_row_data(dut, b_row, dut->b_row_data);
+  set_row_data(a_row, dut->a_row_data);
+  set_row_data(b_row, dut->b_row_data);
 }
 
 void tick(Vsystolic_array* dut) {
@@ -152,11 +271,13 @@ void compare_acc(const char* name, Vsystolic_array* dut, const ChainedArrayRef& 
   for (int i = 0; i < SYS_DIM; ++i) {
     for (int j = 0; j < SYS_DIM; ++j) {
       int idx = i * SYS_DIM + j;
-      int32_t got = static_cast<int32_t>(dut->acc_flat[idx]);
-      if (got != ref.acc[i][j]) {
+      uint32_t got = static_cast<uint32_t>(dut->acc_flat[idx]);
+      uint32_t exp = ref.acc[i][j];
+      if (got != exp) {
         std::fprintf(stderr,
-                     "%s cycle=%d pe=(%d,%d) got=%d exp=%d\n",
-                     name, cycle, i, j, got, ref.acc[i][j]);
+                     "%s cycle=%d pe=(%d,%d) got=0x%08x exp=0x%08x (%g vs %g)\n",
+                     name, cycle, i, j, got, exp,
+                     double(bits_float(got)), double(bits_float(exp)));
         TEST_FAIL(name, "chained array mismatch");
       }
     }
@@ -185,18 +306,18 @@ void test_single_impulse_timing() {
   Row b_row{};
   constexpr int target_row = 7;
   constexpr int target_col = 11;
-  constexpr int8_t a_val = 3;
-  constexpr int8_t b_val = 5;
+  const float a_val = 3.0f;
+  const float b_val = 5.0f;
   int first_nonzero_cycle = -1;
 
-  a_row[target_row] = a_val;
-  b_row[target_col] = b_val;
+  a_row[target_row] = fp32_to_fp16(a_val);
+  b_row[target_col] = fp32_to_fp16(b_val);
   step_and_check(name, &dut, ref, a_row, b_row, 0);
 
   for (int cycle = 1; cycle < CHAIN_TOTAL_STEPS; ++cycle) {
     Row zero{};
     step_and_check(name, &dut, ref, zero, zero, cycle);
-    int32_t got = static_cast<int32_t>(dut.acc_flat[target_row * SYS_DIM + target_col]);
+    uint32_t got = static_cast<uint32_t>(dut.acc_flat[target_row * SYS_DIM + target_col]);
     if ((first_nonzero_cycle < 0) && (got != 0))
       first_nonzero_cycle = cycle;
   }
@@ -206,7 +327,8 @@ void test_single_impulse_timing() {
                  first_nonzero_cycle, target_row + target_col);
     TEST_FAIL(name, "unexpected chained arrival timing");
   }
-  if (static_cast<int32_t>(dut.acc_flat[target_row * SYS_DIM + target_col]) != int32_t(a_val) * int32_t(b_val))
+  uint32_t final_bits = static_cast<uint32_t>(dut.acc_flat[target_row * SYS_DIM + target_col]);
+  if (bits_float(final_bits) != a_val * b_val)
     TEST_FAIL(name, "final impulse value mismatch");
 
   Row zero{};
@@ -220,13 +342,13 @@ void test_identity_stream() {
   ChainedArrayRef ref;
   reset(&dut, ref);
 
-  int8_t a[16][16] = {};
-  int8_t eye[16][16] = {};
+  float a[16][16] = {};
+  float eye[16][16] = {};
 
   for (int i = 0; i < 16; ++i) {
     for (int j = 0; j < 16; ++j) {
-      a[i][j] = static_cast<int8_t>((i * 3 + j) & 0x7F);
-      eye[i][j] = (i == j) ? 1 : 0;
+      a[i][j] = static_cast<float>((i * 3 + j) & 0x7F);   // exact in FP16/FP32
+      eye[i][j] = (i == j) ? 1.0f : 0.0f;
     }
   }
 
@@ -234,8 +356,8 @@ void test_identity_stream() {
     Row a_row{};
     Row b_row{};
     for (int lane = 0; lane < SYS_DIM; ++lane) {
-      a_row[lane] = a[lane][cycle];
-      b_row[lane] = eye[cycle][lane];
+      a_row[lane] = fp32_to_fp16(a[lane][cycle]);
+      b_row[lane] = fp32_to_fp16(eye[cycle][lane]);
     }
     step_and_check(name, &dut, ref, a_row, b_row, cycle);
   }
@@ -247,11 +369,12 @@ void test_identity_stream() {
 
   for (int i = 0; i < SYS_DIM; ++i) {
     for (int j = 0; j < SYS_DIM; ++j) {
-      int32_t got = static_cast<int32_t>(dut.acc_flat[i * SYS_DIM + j]);
-      int32_t exp = (i == j) ? a[i][j] : a[i][j];
-      if (got != exp) {
-        std::fprintf(stderr, "identity result mismatch i=%d j=%d got=%d exp=%d\n",
-                     i, j, got, exp);
+      uint32_t got = static_cast<uint32_t>(dut.acc_flat[i * SYS_DIM + j]);
+      float exp = (i == j) ? a[i][j] : a[i][j];  // result of A * I
+      uint32_t exp_bits = float_bits(exp);
+      if (got != exp_bits) {
+        std::fprintf(stderr, "identity result mismatch i=%d j=%d got=0x%08x exp=0x%08x\n",
+                     i, j, got, exp_bits);
         TEST_FAIL(name, "identity stream mismatch");
       }
     }
@@ -262,30 +385,33 @@ void test_identity_stream() {
   TEST_PASS(name);
 }
 
-void test_signed_extremes() {
-  const char* name = "systolic_array_chained_signed_extremes";
+void test_small_integer_stream() {
+  const char* name = "systolic_array_chained_small_int_stream";
   Vsystolic_array dut;
   ChainedArrayRef ref;
   reset(&dut, ref);
 
-  int8_t a[16][16] = {};
-  int8_t b[16][16] = {};
+  // Inputs in [-8, +7] so 16-element sums of products stay exactly
+  // representable in float32 (no rounding effects to mask the bit-exact
+  // gate). Stresses both signs and the full 16-lane width.
+  float a[16][16] = {};
+  float b[16][16] = {};
 
   for (int i = 0; i < 16; ++i) {
     for (int k = 0; k < 16; ++k)
-      a[i][k] = ((i + k) & 1) ? int8_t(-128) : int8_t(127);
+      a[i][k] = static_cast<float>(((i + k) & 0x0F) - 8);
   }
   for (int k = 0; k < 16; ++k) {
     for (int j = 0; j < 16; ++j)
-      b[k][j] = ((k * 5 + j) & 1) ? int8_t(127) : int8_t(-128);
+      b[k][j] = static_cast<float>(((k * 3 + j * 5) & 0x0F) - 8);
   }
 
   for (int cycle = 0; cycle < SYS_DIM; ++cycle) {
     Row a_row{};
     Row b_row{};
     for (int lane = 0; lane < SYS_DIM; ++lane) {
-      a_row[lane] = a[lane][cycle];
-      b_row[lane] = b[cycle][lane];
+      a_row[lane] = fp32_to_fp16(a[lane][cycle]);
+      b_row[lane] = fp32_to_fp16(b[cycle][lane]);
     }
     step_and_check(name, &dut, ref, a_row, b_row, cycle);
   }
@@ -305,25 +431,23 @@ void test_random_seeded() {
   reset(&dut, ref);
 
   std::mt19937 rng(123456);
-  std::uniform_int_distribution<int> dist(-128, 127);
-  int8_t a[16][16] = {};
-  int8_t b[16][16] = {};
+  std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+  float a[16][16] = {};
+  float b[16][16] = {};
 
-  for (int i = 0; i < 16; ++i) {
+  for (int i = 0; i < 16; ++i)
     for (int k = 0; k < 16; ++k)
-      a[i][k] = static_cast<int8_t>(dist(rng));
-  }
-  for (int k = 0; k < 16; ++k) {
+      a[i][k] = dist(rng);
+  for (int k = 0; k < 16; ++k)
     for (int j = 0; j < 16; ++j)
-      b[k][j] = static_cast<int8_t>(dist(rng));
-  }
+      b[k][j] = dist(rng);
 
   for (int cycle = 0; cycle < SYS_DIM; ++cycle) {
     Row a_row{};
     Row b_row{};
     for (int lane = 0; lane < SYS_DIM; ++lane) {
-      a_row[lane] = a[lane][cycle];
-      b_row[lane] = b[cycle][lane];
+      a_row[lane] = fp32_to_fp16(a[lane][cycle]);
+      b_row[lane] = fp32_to_fp16(b[cycle][lane]);
     }
     step_and_check(name, &dut, ref, a_row, b_row, cycle);
   }
@@ -345,7 +469,7 @@ int main(int argc, char** argv) {
 
   test_single_impulse_timing();
   test_identity_stream();
-  test_signed_extremes();
+  test_small_integer_stream();
   test_random_seeded();
 
   std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);

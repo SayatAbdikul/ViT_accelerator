@@ -1,4 +1,15 @@
 // Focused native regressions for the QK^T debug split.
+//
+// LEGACY (W8A8) -- DO NOT BUILD AS-IS. This test exercises the fused
+// INT8 QK^T path that the W8A16 RTL fork no longer implements: it uses
+// REQUANT, SET_SCALE, INT8 ABUF and INT32 ACCUM oracles. Those opcodes
+// raise FAULT_UNSUPPORTED_OP on the W8A16 RTL (per Phase 5 of the W8A16
+// RTL fork plan, .claude/plans/now-create-a-comprehensive-cheerful-lampson.md),
+// and the supporting INT8 oracles in systolic_test_utils.h were dropped.
+// Kept for reference; excluded from `make all` and not invoked by CI.
+#ifndef ALLOW_LEGACY_INT8_TESTS
+#error "test_systolic_qkt.cpp is legacy INT8 (see comment); define ALLOW_LEGACY_INT8_TESTS to build."
+#endif
 
 #include "Vtaccel_top.h"
 #include "Vtaccel_top___024root.h"

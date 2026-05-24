@@ -3,17 +3,23 @@
 
 `include "taccel_pkg.sv"
 
-// Systolic MATMUL controller.
+// Systolic MATMUL controller (W8A16 datapath).
 //
 // Responsibilities:
 //   - latch one MATMUL instruction on dispatch
 //   - walk the logical M/N/K tile grid one 16x16 systolic tile at a time
 //   - stream src1/src2 rows into the array
-//   - drain the 16x16 INT32 accumulator tile back to SRAM
+//   - drain the 16x16 FP32 accumulator tile back to ACCUM SRAM
 //
-// The controller is asynchronous from the main control FSM: control emits a
-// one-cycle dispatch pulse, then later observes `sys_busy` dropping to know the
-// operation has completed.
+// FP16 cadence: a 16-lane mesh input row is 16 FP16 = 32 B = two 128-bit
+// SRAM rows. Every real K-step therefore takes 4 cycles (LO_REQ, LO_USE,
+// HI_REQ, HI_USE) and step_en pulses only on HI_USE after both halves are
+// latched. The PE skew/chain depends on step_en pulses, not raw cycle
+// count, so chained-mode bit-exactness is preserved.
+//
+// Chained-mode flush cycles (lane_q >= SYS_DIM) inject FP16 +0 directly
+// and pulse step_en every cycle (no SRAM reads needed) -- this keeps the
+// flush phase short relative to the real K phase.
 
 module systolic_controller
   import taccel_pkg::*;
@@ -54,20 +60,24 @@ module systolic_controller
   input  logic [127:0]         sram_b_rdata
 );
 
-  // READ_REQ issues synchronous SRAM reads, READ_USE consumes the returned rows
-  // one cycle later, and DRAIN_WR writes the accumulated 16x16 tile back out as
-  // 64 rows of 4xINT32 each.
+  // Sub-states track the 2-cycle SRAM read latency. Each real K-step is
+  // ST_READ_REQ (issue lo) -> ST_READ_USE (latch lo, issue hi) ->
+  // ST_READ_USE_HI (latch hi, assert step_en). Chained-mode flush cycles
+  // collapse the cadence: ST_READ_FLUSH pulses step_en with zero data
+  // in one cycle.
   typedef enum logic [3:0] {
-    ST_IDLE       = 4'd0,
-    ST_INIT_TILE  = 4'd1,
-    ST_READ_REQ   = 4'd2,
-    ST_READ_USE   = 4'd3,
-    ST_DRAIN_PREP = 4'd4,
-    ST_DRAIN_WR   = 4'd5,
-    ST_A_LOAD_REQ = 4'd6,
-    ST_A_LOAD_LATCH = 4'd7,
-    ST_DST_CLEAR_PREP = 4'd8,
-    ST_DST_CLEAR_WR   = 4'd9
+    ST_IDLE           = 4'd0,
+    ST_INIT_TILE      = 4'd1,
+    ST_READ_REQ       = 4'd2,   // issue B lo SRAM read
+    ST_READ_USE       = 4'd3,   // latch B lo, issue B hi
+    ST_READ_USE_HI    = 4'd4,   // latch B hi, step_en, advance K
+    ST_DRAIN_PREP     = 4'd5,
+    ST_DRAIN_WR       = 4'd6,
+    ST_A_LOAD_REQ     = 4'd7,
+    ST_A_LOAD_LATCH   = 4'd8,
+    ST_DST_CLEAR_PREP = 4'd9,
+    ST_DST_CLEAR_WR   = 4'd10,
+    ST_READ_FLUSH     = 4'd11   // chained-mode flush (zero injection)
   } state_t;
 
   state_t state;
@@ -80,11 +90,17 @@ module systolic_controller
   logic [10:0] mtile_q, ntile_q, ktile_q;
   logic [5:0]  lane_q;
   logic [4:0]  a_load_row_q;
+  logic        a_half_q;
   logic [4:0]  drain_row_q;
   logic [1:0]  drain_grp_q;
   logic [31:0] dst_clear_row_idx_q;
   logic [31:0] dst_clear_total_rows_q;
-  logic [7:0]  a_tile_scratch [0:SYS_DIM-1][0:SYS_DIM-1];
+  logic [15:0] a_tile_scratch [0:SYS_DIM-1][0:SYS_DIM-1];
+
+  // Half-row registers for assembling 256-bit b_row_data from two
+  // 128-bit SRAM reads. b_lo_reg holds lanes [0..7] (the first SRAM
+  // read of the K-step); b_hi_reg holds lanes [8..15].
+  logic [127:0] b_lo_reg;
 
   // Row-major drain address tracking.
   // tile_drain_base_q = dst_off + mtile * n_tiles * 64 (advances by n_tiles*64 per M-tile).
@@ -94,11 +110,9 @@ module systolic_controller
   logic [15:0] tile_drain_base_q;
   logic [15:0] drain_row_addr_q;
 
-  logic step_en;
-  logic clear_acc;
-  logic       inject_zero_data;
-  logic [15:0] lane_row_idx;
-  logic [127:0] a_row_data_q, b_row_data_q;
+  logic        step_en;
+  logic        clear_acc;
+  logic [SYS_DIM*16-1:0]  a_row_data_q, b_row_data_q;
   logic [SYS_DIM*SYS_DIM*32-1:0] acc_flat;
 
   localparam int CHAIN_FLUSH_CYCLES = (2 * (SYS_DIM - 1));
@@ -107,13 +121,13 @@ module systolic_controller
   systolic_array #(
     .SYSTOLIC_ARCH_MODE(SYSTOLIC_ARCH_MODE)
   ) u_array (
-    .clk      (clk),
-    .rst_n    (rst_n),
-    .step_en  (step_en),
-    .clear_acc(clear_acc),
-    .a_row_data(a_row_data_q),
-    .b_row_data(b_row_data_q),
-    .acc_flat (acc_flat)
+    .clk        (clk),
+    .rst_n      (rst_n),
+    .step_en    (step_en),
+    .clear_acc  (clear_acc),
+    .a_row_data (a_row_data_q),
+    .b_row_data (b_row_data_q),
+    .acc_flat   (acc_flat)
   );
 
   function automatic logic [31:0] acc_at(
@@ -127,19 +141,21 @@ module systolic_controller
     end
   endfunction
 
-  // Source SRAM is presented to MATMUL in compiler-visible row-major form:
-  //   src1 = A[M,K] with K/16 row units per logical row
-  //   src2 = B[K,N] with N/16 row units per logical row
-  // The controller stages one 16x16 A tile locally, then streams its columns
-  // into the array while reading the matching B rows directly from SRAM.
+  // Source SRAM layout (W8A16, FP16 endpoints):
+  //   src1 = A[M,K] FP16, row-major; one M-row spans K/8 SRAM rows
+  //                                (= k_tiles_q * 2)
+  //   src2 = B[K,N] FP16, row-major; one K-row spans N/8 SRAM rows
+  //                                (= n_tiles_q * 2)
+  // Each 16-byte SRAM row holds 8 FP16 lanes. A K-tile of width 16 thus
+  // consumes two SRAM rows per logical row.
   logic [31:0] src1_row_units, src2_row_units;
   logic [31:0] src1_logical_row, src2_logical_row;
   logic [31:0] src1_load_row_addr, src2_stream_row_addr;
   logic [31:0] dispatch_m_tiles_w, dispatch_n_tiles_w, dispatch_clear_rows_w;
   logic        needs_dst_preclear_w;
   always_comb begin
-    src1_row_units = {21'h0, k_tiles_q};
-    src2_row_units = {21'h0, n_tiles_q};
+    src1_row_units = {20'h0, k_tiles_q, 1'b0};   // k_tiles_q * 2
+    src2_row_units = {20'h0, n_tiles_q, 1'b0};   // n_tiles_q * 2
 
     dispatch_m_tiles_w = {22'h0, tile_m} + 32'd1;
     dispatch_n_tiles_w = {22'h0, tile_n} + 32'd1;
@@ -149,8 +165,16 @@ module systolic_controller
     src1_logical_row = ({21'h0, mtile_q} << 4) + {27'h0, a_load_row_q};
     src2_logical_row = ({21'h0, ktile_q} << 4) + {26'h0, lane_q};
 
-    src1_load_row_addr = {16'h0, src1_off_q} + (src1_logical_row * src1_row_units) + {21'h0, ktile_q};
-    src2_stream_row_addr = {16'h0, src2_off_q} + (src2_logical_row * src2_row_units) + {21'h0, ntile_q};
+    // FP16 K-tile = 2 SRAM rows; address ktile_q*2 + a_half_q for src1,
+    // ntile_q*2 + b_half_q for src2 (b_half_q implicit in state).
+    src1_load_row_addr = {16'h0, src1_off_q}
+                       + (src1_logical_row * src1_row_units)
+                       + ({20'h0, ktile_q, 1'b0})
+                       + {31'h0, a_half_q};
+    src2_stream_row_addr = {16'h0, src2_off_q}
+                         + (src2_logical_row * src2_row_units)
+                         + ({20'h0, ntile_q, 1'b0});
+    // b_half_q toggle is added in the case statement below.
   end
 
   // Tile-walking FSM. One MATMUL dispatch can cover many logical 16x16 tiles
@@ -173,15 +197,17 @@ module systolic_controller
       ktile_q <= 11'd0;
       lane_q <= 6'd0;
       a_load_row_q <= 5'd0;
+      a_half_q <= 1'b0;
       drain_row_q <= 5'd0;
       drain_grp_q <= 2'd0;
       dst_clear_row_idx_q <= 32'd0;
       dst_clear_total_rows_q <= 32'd0;
       tile_drain_base_q <= 16'h0;
       drain_row_addr_q <= 16'h0;
+      b_lo_reg <= 128'h0;
       for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1)
         for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
-          a_tile_scratch[row_idx][col_idx] <= 8'h0;
+          a_tile_scratch[row_idx][col_idx] <= 16'h0;
     end else begin
       case (state)
         ST_IDLE: begin
@@ -202,6 +228,7 @@ module systolic_controller
             ktile_q <= 11'd0;
             lane_q <= 6'd0;
             a_load_row_q <= 5'd0;
+            a_half_q <= 1'b0;
             drain_row_q <= 5'd0;
             drain_grp_q <= 2'd0;
             dst_clear_row_idx_q <= 32'd0;
@@ -232,6 +259,7 @@ module systolic_controller
         ST_INIT_TILE: begin
           lane_q <= 6'd0;
           a_load_row_q <= 5'd0;
+          a_half_q <= 1'b0;
           state <= ST_A_LOAD_REQ;
         end
 
@@ -240,28 +268,52 @@ module systolic_controller
         end
 
         ST_A_LOAD_LATCH: begin
-          for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
-            a_tile_scratch[a_load_row_q[3:0]][col_idx] <= sram_b_rdata[(col_idx * 8) +: 8];
+          // Each SRAM read provides 8 FP16 lanes. Steer to columns
+          // [0..7] when a_half_q==0, [8..15] when a_half_q==1.
+          for (int col_idx = 0; col_idx < 8; col_idx = col_idx + 1)
+            a_tile_scratch[a_load_row_q[3:0]][col_idx + (a_half_q ? 8 : 0)]
+              <= sram_b_rdata[(col_idx * 16) +: 16];
 
-          if (a_load_row_q == 5'd15) begin
-            lane_q <= 6'd0;
-            state <= ST_READ_REQ;
-          end else begin
-            a_load_row_q <= a_load_row_q + 5'd1;
+          if (a_half_q == 1'b0) begin
+            a_half_q <= 1'b1;
             state <= ST_A_LOAD_REQ;
+          end else begin
+            a_half_q <= 1'b0;
+            if (a_load_row_q == 5'd15) begin
+              lane_q <= 6'd0;
+              state <= ST_READ_REQ;
+            end else begin
+              a_load_row_q <= a_load_row_q + 5'd1;
+              state <= ST_A_LOAD_REQ;
+            end
           end
         end
 
         ST_READ_REQ: begin
+          // SRAM read issued combinationally below; advance to latch state.
           state <= ST_READ_USE;
         end
 
         ST_READ_USE: begin
-          if (int'(lane_q) == ((SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED) ? (CHAIN_TOTAL_STEPS - 1) : (SYS_DIM - 1))) begin
-            lane_q <= 6'd0;
-            if (ktile_q + 11'd1 < k_tiles_q) begin
+          // Latched the LO half this cycle. Issue HI read.
+          b_lo_reg <= sram_a_rdata;
+          state <= ST_READ_USE_HI;
+        end
+
+        ST_READ_USE_HI: begin
+          // Latched the HI half; b_row_data_q assembled combinationally
+          // below using {sram_a_rdata, b_lo_reg}. step_en pulses this
+          // cycle and we advance to the next K-step (or out of the K
+          // loop into chained-mode flush / drain).
+          if (lane_q == 6'd15) begin
+            // Last real K-step in this K-tile (lane_q == SYS_DIM-1).
+            if (SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED) begin
+              lane_q <= lane_q + 6'd1;
+              state <= ST_READ_FLUSH;
+            end else if (ktile_q + 11'd1 < k_tiles_q) begin
               ktile_q <= ktile_q + 11'd1;
               a_load_row_q <= 5'd0;
+              a_half_q <= 1'b0;
               state <= ST_A_LOAD_REQ;
             end else begin
               drain_row_q <= 5'd0;
@@ -271,6 +323,26 @@ module systolic_controller
           end else begin
             lane_q <= lane_q + 6'd1;
             state <= ST_READ_REQ;
+          end
+        end
+
+        ST_READ_FLUSH: begin
+          // Chained-mode only: keep pulsing step_en with zero a/b until
+          // CHAIN_TOTAL_STEPS-1 step pulses have been emitted total.
+          if (lane_q == 6'(CHAIN_TOTAL_STEPS - 1)) begin
+            lane_q <= 6'd0;
+            if (ktile_q + 11'd1 < k_tiles_q) begin
+              ktile_q <= ktile_q + 11'd1;
+              a_load_row_q <= 5'd0;
+              a_half_q <= 1'b0;
+              state <= ST_A_LOAD_REQ;
+            end else begin
+              drain_row_q <= 5'd0;
+              drain_grp_q <= 2'd0;
+              state <= ST_DRAIN_PREP;
+            end
+          end else begin
+            lane_q <= lane_q + 6'd1;
           end
         end
 
@@ -314,20 +386,21 @@ module systolic_controller
   always_comb begin
     sys_busy = (state != ST_IDLE);
 
-    // During chained flush cycles, inject zeros so only in-flight operands
-    // continue propagating through the PE mesh.
-    inject_zero_data = (SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED)
-                    && (int'(lane_q) >= SYS_DIM)
-                    && ((state == ST_READ_REQ) || (state == ST_READ_USE));
-    lane_row_idx = (SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED)
-               ? {10'h0, lane_q[5:0]}
-               : {10'h0, lane_q[5:0]};
-    a_row_data_q = 128'h0;
-    for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1) begin
-      if (!inject_zero_data && (lane_q < 6'd16))
-        a_row_data_q[(row_idx * 8) +: 8] = a_tile_scratch[row_idx][lane_q[3:0]];
+    // a_row_data: 16 FP16 lanes from the A-tile scratch at K-column lane_q[3:0].
+    // Real K-steps: lane_q in [0..15] indexes the scratch column directly.
+    // Chained-flush cycles: 256'h0 injection.
+    a_row_data_q = {(SYS_DIM*16){1'b0}};
+    if ((state == ST_READ_REQ) || (state == ST_READ_USE) || (state == ST_READ_USE_HI)) begin
+      for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1)
+        a_row_data_q[(row_idx * 16) +: 16] = a_tile_scratch[row_idx][lane_q[3:0]];
     end
-    b_row_data_q = inject_zero_data ? 128'h0 : sram_a_rdata;
+
+    // b_row_data: assembled from LO (latched in b_lo_reg) and HI (this
+    // cycle's sram_a_rdata) only on ST_READ_USE_HI. Otherwise zero.
+    b_row_data_q = {(SYS_DIM*16){1'b0}};
+    if (state == ST_READ_USE_HI) begin
+      b_row_data_q = {sram_a_rdata, b_lo_reg};
+    end
 
     sram_a_en = 1'b0;
     sram_a_we = 1'b0;
@@ -351,25 +424,40 @@ module systolic_controller
       end
 
       ST_READ_REQ: begin
-        // Issue both source reads together. Their rows appear one cycle later
-        // in ST_READ_USE, which then advances the systolic mesh by one step.
-        if (inject_zero_data) begin
-          sram_b_en = 1'b0;
-          sram_a_en = 1'b0;
-        end else begin
-          sram_a_en = 1'b1;
-          sram_a_we = 1'b0;
-          sram_a_buf = src2_buf_q;
-          sram_a_row = src2_stream_row_addr[15:0];
-        end
+        // Issue the LO read of B for the current K-step. The HI read is
+        // issued in ST_READ_USE (one cycle later). Returned data arrives
+        // one cycle after the request -- LO appears in ST_READ_USE,
+        // HI appears in ST_READ_USE_HI.
+        sram_a_en = 1'b1;
+        sram_a_we = 1'b0;
+        sram_a_buf = src2_buf_q;
+        sram_a_row = src2_stream_row_addr[15:0];  // b_half_q = 0
       end
 
       ST_READ_USE: begin
+        // LO data is at sram_a_rdata this cycle (registered into
+        // b_lo_reg in the FF block). Issue HI read.
+        sram_a_en = 1'b1;
+        sram_a_we = 1'b0;
+        sram_a_buf = src2_buf_q;
+        sram_a_row = src2_stream_row_addr[15:0] + 16'd1;  // b_half_q = 1
+      end
+
+      ST_READ_USE_HI: begin
+        // HI data is at sram_a_rdata this cycle. Mesh advances; no new
+        // SRAM read needed.
+        step_en = 1'b1;
+      end
+
+      ST_READ_FLUSH: begin
+        // Chained-mode flush: a_row_data_q and b_row_data_q are both
+        // 256'h0 (set above). Pulse step_en, no SRAM activity.
         step_en = 1'b1;
       end
 
       ST_DRAIN_WR: begin
-        // Pack four neighboring INT32 accumulators into one 128-bit SRAM row.
+        // Pack four neighboring FP32 accumulators into one 128-bit
+        // ACCUM SRAM row.
         sram_a_en = 1'b1;
         sram_a_we = 1'b1;
         sram_a_buf = dst_buf_q;
@@ -381,9 +469,6 @@ module systolic_controller
       end
 
       ST_DST_CLEAR_WR: begin
-        // Non-accumulating MATMUL starts from a clean architectural
-        // destination span. Clear the full padded ACCUM tile region once
-        // before the first compute tile begins.
         sram_a_en = 1'b1;
         sram_a_we = 1'b1;
         sram_a_buf = dst_buf_q;

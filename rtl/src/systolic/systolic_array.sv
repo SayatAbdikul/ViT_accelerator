@@ -3,13 +3,18 @@
 
 `include "taccel_pkg.sv"
 
-// 16x16 systolic mesh wrapper.
+// 16x16 systolic mesh wrapper (W8A16 datapath).
 //
-// Input rows arrive as packed 16-byte vectors. The wrapper unpacks them into
-// lane vectors, optionally applies boundary skew for chained mode, and wires
-// the PE mesh in either:
-  //   - broadcast mode: each row/column sees the same lane value
-  //   - chained mode: operands flow across the mesh one PE per cycle
+// A 16-lane row is 16 FP16 = 32 bytes = 256 bits, twice the SRAM row width.
+// The controller assembles two 128-bit SRAM reads into the 256-bit row vector
+// presented here, then pulses step_en once per K-strip; the array is unaware
+// of the assembly cadence. Internally each lane is unpacked into FP16 and
+// passed to a PE that widens to FP32 before MAC. ACC is FP32 (32 bits).
+//
+// Modes:
+//   - broadcast: each row/column sees the same lane value
+//   - chained:   operands flow across the mesh one PE per cycle, with skew
+//                registers (now 16-bit FP16) on the boundary
 
 module systolic_array
   import taccel_pkg::*;
@@ -17,36 +22,36 @@ module systolic_array
   parameter int SYSTOLIC_ARCH_MODE = SYS_MODE_DEFAULT
 )
 (
-  input  logic                         clk,
-  input  logic                         rst_n,
-  input  logic                         step_en,
-  input  logic                         clear_acc,
-  input  logic [AXI_DATA_W-1:0]        a_row_data,
-  input  logic [AXI_DATA_W-1:0]        b_row_data,
-  output logic [SYS_DIM*SYS_DIM*32-1:0] acc_flat
+  input  logic                          clk,
+  input  logic                          rst_n,
+  input  logic                          step_en,
+  input  logic                          clear_acc,
+  input  logic [SYS_DIM*16-1:0]         a_row_data,   // 16 FP16 lanes
+  input  logic [SYS_DIM*16-1:0]         b_row_data,   // 16 FP16 lanes
+  output logic [SYS_DIM*SYS_DIM*32-1:0] acc_flat      // 16x16 FP32 accs
 );
 
-  logic [7:0] a_vec [0:SYS_DIM-1];
-  logic [7:0] b_vec [0:SYS_DIM-1];
-  logic [7:0] a_edge_vec [0:SYS_DIM-1];
-  logic [7:0] b_edge_vec [0:SYS_DIM-1];
-  logic [7:0] a_skew [0:SYS_DIM-1][0:SYS_DIM-2];
-  logic [7:0] b_skew [0:SYS_DIM-1][0:SYS_DIM-2];
+  logic [15:0] a_vec [0:SYS_DIM-1];
+  logic [15:0] b_vec [0:SYS_DIM-1];
+  logic [15:0] a_edge_vec [0:SYS_DIM-1];
+  logic [15:0] b_edge_vec [0:SYS_DIM-1];
+  logic [15:0] a_skew [0:SYS_DIM-1][0:SYS_DIM-2];
+  logic [15:0] b_skew [0:SYS_DIM-1][0:SYS_DIM-2];
 
   // PE-local state and interconnect signals.
-  logic [31:0] pe_acc [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_a_in  [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_b_in  [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_a_out [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_b_out [0:SYS_DIM-1][0:SYS_DIM-1];
+  logic [31:0] pe_acc   [0:SYS_DIM-1][0:SYS_DIM-1];
+  logic [15:0] pe_a_in  [0:SYS_DIM-1][0:SYS_DIM-1];
+  logic [15:0] pe_b_in  [0:SYS_DIM-1][0:SYS_DIM-1];
+  logic [15:0] pe_a_out [0:SYS_DIM-1][0:SYS_DIM-1];
+  logic [15:0] pe_b_out [0:SYS_DIM-1][0:SYS_DIM-1];
 
   genvar i, j;
-  // Unpack the incoming 128-bit rows into 16 signed INT8 lanes and select the
+  // Unpack the incoming 256-bit rows into 16 FP16 lanes and select the
   // edge-fed values used in chained mode after skew insertion.
   generate
     for (i = 0; i < SYS_DIM; i++) begin : GEN_A_B
-      assign a_vec[i] = a_row_data[i*8 +: 8];
-      assign b_vec[i] = b_row_data[i*8 +: 8];
+      assign a_vec[i] = a_row_data[i*16 +: 16];
+      assign b_vec[i] = b_row_data[i*16 +: 16];
 
       if (i == 0) begin : GEN_EDGE_NO_DELAY
         assign a_edge_vec[i] = a_vec[i];
@@ -59,21 +64,22 @@ module systolic_array
   endgenerate
 
   // Chained systolic mode requires boundary skew so A/B operands that belong
-  // to the same k arrive at each PE on the same cycle.
+  // to the same k arrive at each PE on the same cycle. Skew regs are FP16 +0
+  // on reset/clear (16'h0 = FP16 +0.0, which is also FP32 +0.0 after widen).
   always_ff @(posedge clk or negedge rst_n) begin : SKew_PIPE
     int r, s;
     if (!rst_n) begin
       for (r = 0; r < SYS_DIM; r++) begin
         for (s = 0; s < SYS_DIM-1; s++) begin
-          a_skew[r][s] <= 8'h00;
-          b_skew[r][s] <= 8'h00;
+          a_skew[r][s] <= 16'h0;
+          b_skew[r][s] <= 16'h0;
         end
       end
     end else if (clear_acc) begin
       for (r = 0; r < SYS_DIM; r++) begin
         for (s = 0; s < SYS_DIM-1; s++) begin
-          a_skew[r][s] <= 8'h00;
-          b_skew[r][s] <= 8'h00;
+          a_skew[r][s] <= 16'h0;
+          b_skew[r][s] <= 16'h0;
         end
       end
     end else if (step_en) begin
@@ -92,8 +98,6 @@ module systolic_array
   // - Broadcast mode: all PEs in row/col see same a_vec/b_vec lane.
   // - Chained mode: left/top edge injects a_vec/b_vec and interior PEs consume
   //   neighbor outputs (west/east for A, north/south for B).
-  // Route either broadcast inputs or neighbor-forwarded chained inputs into
-  // each PE. This keeps the PE itself oblivious to the global architecture.
   generate
     for (i = 0; i < SYS_DIM; i++) begin : GEN_ROUTE_ROW
       for (j = 0; j < SYS_DIM; j++) begin : GEN_ROUTE_COL
@@ -110,8 +114,8 @@ module systolic_array
     end
   endgenerate
 
-  // Instantiate the full mesh and flatten the accumulator matrix for the
-  // controller's writeback logic.
+  // Instantiate the full mesh and flatten the FP32 accumulator matrix for
+  // the controller's writeback logic.
   generate
     for (i = 0; i < SYS_DIM; i++) begin : GEN_ROW
       for (j = 0; j < SYS_DIM; j++) begin : GEN_COL

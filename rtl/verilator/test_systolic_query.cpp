@@ -1,4 +1,16 @@
 // Focused native regression for the first query-projection ACCUM path.
+//
+// LEGACY (W8A8) -- DO NOT BUILD AS-IS. This test targets the INT8 query
+// projection that the W8A16 RTL fork no longer implements: it uses INT8
+// MATMUL inputs and INT32 ACCUM oracles. systolic_test_utils.h was
+// rewritten for the FP16 datapath (Phase 2 of the W8A16 RTL fork plan,
+// see .claude/plans/now-create-a-comprehensive-cheerful-lampson.md), so
+// this file no longer compiles against it. Kept for reference until the
+// W8A16 parity harness in Phase 6 replaces this coverage; the file is
+// excluded from `make all` and is not invoked by CI.
+#ifndef ALLOW_LEGACY_INT8_TESTS
+#error "test_systolic_query.cpp is legacy INT8 (see comment); define ALLOW_LEGACY_INT8_TESTS to build."
+#endif
 
 #include "Vtaccel_top.h"
 #include "verilated.h"
