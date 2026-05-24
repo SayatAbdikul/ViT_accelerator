@@ -29,6 +29,7 @@ module tb_fp32_prim
                result_bits = 32'd0;
                q_i32 = 32'(fp32_quantize_i8_bits(a_bits, b_bits));
              end
+      4'd11: result_bits = {16'd0, fp32_to_fp16_bits(a_bits)};
       default: result_bits = FP32_QNAN_BITS;
     endcase
   end

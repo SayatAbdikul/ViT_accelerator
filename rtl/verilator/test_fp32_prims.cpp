@@ -25,6 +25,7 @@ enum Op : uint8_t {
     OP_ROUND = 0, OP_ADD = 1, OP_SUB = 2, OP_MUL = 3,
     OP_DIV = 4, OP_SQRT = 5, OP_EXP = 6, OP_ERF = 7,
     OP_GELU = 8, OP_FROM_FP16 = 9, OP_QUANT = 10,
+    OP_TO_FP16 = 11,
 };
 
 uint32_t float_bits(float value) {
@@ -123,6 +124,52 @@ uint32_t from_fp16_ref(uint16_t h) {  // mirrors fp32_from_fp16_bits exactly
     if (e == 0x1F) return s ? 0xC77FE000u : 0x477FE000u;
     return (s << 31) | ((e + 112u) << 23) | (f << 13);
 }
+// Mirrors fp32_to_fp16_bits exactly. RNE narrowing; finite overflow → ±inf
+// (matches numpy.float32(...).astype(np.float16) under default casting).
+uint16_t to_fp16_ref(uint32_t f) {
+    uint32_t s   = (f >> 31) & 1u;
+    uint32_t e8  = (f >> 23) & 0xFFu;
+    uint32_t f23 = f & 0x7FFFFFu;
+    if (e8 == 0xFFu && f23 != 0u) {
+        return (uint16_t)((s << 15) | (0x1Fu << 10) | 0x200u);   // NaN
+    }
+    if (e8 == 0xFFu) {
+        return (uint16_t)((s << 15) | (0x1Fu << 10));            // ±inf
+    }
+    if (e8 == 0u) {
+        return (uint16_t)(s << 15);                              // FP32 zero/denorm → ±0
+    }
+    int e_unb = (int)e8 - 127;
+    uint64_t mant24 = (1ULL << 23) | (uint64_t)f23;
+    auto rshift_rne = [](uint64_t value, int shift) -> uint64_t {
+        if (shift <= 0) return value << (-shift);
+        if (shift >= 63) {
+            uint64_t half = 1ULL << 63;
+            return (value > half || (value == half && false)) ? 1ULL : 0ULL;
+        }
+        uint64_t q = value >> shift;
+        uint64_t mask = (1ULL << shift) - 1ULL;
+        uint64_t r = value & mask;
+        uint64_t half = 1ULL << (shift - 1);
+        if (r > half || (r == half && (q & 1ULL))) return q + 1ULL;
+        return q;
+    };
+    if (e_unb > 15) return (uint16_t)((s << 15) | (0x1Fu << 10));    // overflow → ±inf
+    if (e_unb >= -14) {
+        uint64_t rounded = rshift_rne(mant24, 13);
+        if (rounded == 0x800ULL) {
+            if (e_unb + 1 > 15) return (uint16_t)((s << 15) | (0x1Fu << 10));
+            return (uint16_t)((s << 15) | (uint32_t)((e_unb + 1 + 15) << 10));
+        }
+        return (uint16_t)((s << 15) | (uint32_t)((e_unb + 15) << 10) |
+                          (uint32_t)(rounded & 0x3FFu));
+    }
+    int shift_amt = 13 + (-14 - e_unb);
+    uint64_t rounded = rshift_rne(mant24, shift_amt);
+    if (rounded == 0x400ULL) return (uint16_t)((s << 15) | (1u << 10));   // → smallest normal
+    return (uint16_t)((s << 15) | (uint32_t)(rounded & 0x3FFu));
+}
+
 int quant_ref(uint32_t vb, uint32_t sb) {
     float s = bits_float(sb);
     if (s == 0.0f) return 0;
@@ -222,6 +269,70 @@ int main(int argc, char **argv) {
     // ── from_fp16: exact integer rewiring incl. ±65504 inf/NaN clamp ─────
     for (uint32_t h = 0; h < 65536; ++h)
         chk("fp16", OP_FROM_FP16, h, 0, from_fp16_ref((uint16_t)h));
+
+    // ── to_fp16: RNE narrowing, ±inf on overflow, ±0 on FP32 denormals ───
+    auto chk_fp16 = [&](const std::string &n, uint32_t a, uint16_t e) {
+        uint32_t got = evalr(tb, OP_TO_FP16, a, 0);
+        uint16_t got16 = (uint16_t)(got & 0xFFFFu);
+        if (got16 != e) {
+            if (failures < 20)
+                std::cerr << "[FAIL] " << n << " a=0x" << std::hex << a
+                          << " got=0x" << got16 << " exp=0x" << e << std::dec << "\n";
+            failures++;
+        }
+    };
+    // Round-trip every FP16 pattern through FP32 widen → narrow.
+    // Identity for every finite FP16 (incl. subnormals). For FP16 ±inf and
+    // NaN: the existing fp32_from_fp16_bits clamps both to FP32 ±65504
+    // (sign-preserving, no FP32 NaN/inf produced), so the narrowed value
+    // comes back as the FP16 max-normal pattern (0x7BFF / 0xFBFF), not
+    // the original inf/NaN. The clamp is the established contract — see
+    // the `±65504 inf/NaN clamp` comment on the from_fp16 test block above.
+    for (uint32_t h = 0; h < 65536; ++h) {
+        uint16_t hh = (uint16_t)h;
+        uint32_t e  = (hh >> 10) & 0x1Fu;
+        uint16_t expected;
+        if (e == 0x1F) {
+            expected = (uint16_t)((hh & 0x8000u) | 0x7BFFu);  // ±inf / NaN → ±max-normal
+        } else {
+            expected = hh;                                     // finite → identity
+        }
+        chk_fp16("to_fp16_rt", from_fp16_ref(hh), expected);
+    }
+    // Hand-picked FP32 patterns: zero / inf / NaN / overflow / underflow.
+    struct TC { const char *name; uint32_t a; uint16_t e; };
+    const TC dir[] = {
+        {"+0",       0x00000000u, 0x0000u},
+        {"-0",       0x80000000u, 0x8000u},
+        {"+inf",     0x7f800000u, 0x7C00u},
+        {"-inf",     0xff800000u, 0xFC00u},
+        {"qnan",     0x7fc00000u, (uint16_t)((0x1Fu<<10)|0x200u)},
+        {"snan_pl",  0x7f800001u, (uint16_t)((0x1Fu<<10)|0x200u)},
+        {"overflow", float_bits(70000.0f), 0x7C00u},          // matches numpy
+        {"neg_ovr",  float_bits(-70000.0f), 0xFC00u},
+        {"max16",    float_bits(65504.0f), 0x7BFFu},
+        {"just_ovr", float_bits(65520.0f), 0x7C00u},          // halfway between 65504 and 65536 RNE → inf
+        {"underflow_to_zero", float_bits(1e-15f), 0x0000u},
+        {"smallest_subnorm", float_bits(5.96046448e-8f), 0x0001u},
+        {"largest_subnorm",  float_bits(6.09755516e-5f), 0x03FFu},
+        {"smallest_normal",  float_bits(6.10351562e-5f), 0x0400u},
+        {"one",              float_bits(1.0f),  0x3C00u},
+        {"neg_one",          float_bits(-1.0f), 0xBC00u},
+        {"two",              float_bits(2.0f),  0x4000u},
+        {"half",             float_bits(0.5f),  0x3800u},
+        {"third_rne",        float_bits(0.33333334f), 0x3555u},
+    };
+    for (auto &t : dir) chk_fp16(t.name, t.a, t.e);
+    // Random stress: walk biased exponents across the FP16 representable
+    // band so the RNE rounding and subnormal alignment paths are exercised.
+    for (int i = 0; i < 1000000; ++i) {
+        uint32_t a = (nxt() & 0x807fffffu) | (((100u + (nxt() % 30u)) & 0xFFu) << 23);
+        float xf = bits_float(a);
+        // Cross-check against numpy-style oracle (above). Use the C++ helper
+        // (to_fp16_ref) since libm has no portable FP32→FP16 RNE.
+        chk_fp16("rnd_to_fp16", a, to_fp16_ref(a));
+        (void)xf;
+    }
 
     // ── quantize_i8: div + round-half-even + clip ────────────────────────
     {

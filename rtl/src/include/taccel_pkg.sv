@@ -17,6 +17,17 @@ package taccel_pkg;
 
   // -------------------------------------------------------------------------
   // Opcodes (5-bit, instruction bits [63:59])
+  //
+  // Four opcodes are documented unsupported on the W8A16 datapath:
+  //   - OP_REQUANT      (0x0B): INT8 requant from INT32 ACCUM — needs INT8
+  //                              endpoints, which W8A16 does not produce.
+  //   - OP_REQUANT_PC   (0x11): per-channel variant of OP_REQUANT.
+  //   - OP_SOFTMAX_ATTNV (0x12): fused INT8 softmax×V — INT8-bridging only.
+  //   - OP_DEQUANT_ADD  (0x13): fused INT8→FP residual — INT8-bridging only.
+  // They remain valid ISA encodings (forward-compatible for any future RTL
+  // that re-adds an INT8 datapath) but the W8A16 RTL raises
+  // FAULT_UNSUPPORTED_OP on dispatch. See the W8A16 codegen in
+  // software/taccel/compiler/codegen_w8a16.py — these are never emitted.
   // -------------------------------------------------------------------------
   typedef enum logic [4:0] {
     OP_NOP         = 5'h00,
@@ -30,25 +41,35 @@ package taccel_pkg;
     OP_STORE       = 5'h08,
     OP_BUF_COPY    = 5'h09,
     OP_MATMUL      = 5'h0A,
-    OP_REQUANT     = 5'h0B,
+    OP_REQUANT     = 5'h0B,  // unsupported in W8A16 RTL: FAULT_UNSUPPORTED_OP
     OP_SCALE_MUL   = 5'h0C,
     OP_VADD        = 5'h0D,
     OP_SOFTMAX     = 5'h0E,
     OP_LAYERNORM   = 5'h0F,
     OP_GELU        = 5'h10,
-    OP_REQUANT_PC  = 5'h11,
-    OP_SOFTMAX_ATTNV = 5'h12,
-    OP_DEQUANT_ADD = 5'h13
+    OP_REQUANT_PC  = 5'h11,  // unsupported in W8A16 RTL: FAULT_UNSUPPORTED_OP
+    OP_SOFTMAX_ATTNV = 5'h12,// unsupported in W8A16 RTL: FAULT_UNSUPPORTED_OP
+    OP_DEQUANT_ADD = 5'h13   // unsupported in W8A16 RTL: FAULT_UNSUPPORTED_OP
     // 5'h14–5'h1F: reserved — illegal instruction fault
   } opcode_t;
 
   // -------------------------------------------------------------------------
   // Buffer IDs (2-bit)
+  //
+  // The byte sizes and 16-byte row geometry are fixed by the ISA; the bit
+  // interpretation of each element is set by the precision mode the RTL
+  // implements. For the W8A16 datapath (the shipping software contract —
+  // see software/taccel/golden_model/state_w8a16.py) the layout is:
+  //   ABUF  : 8 FP16 elements per 16-byte row (16 × 8 KB rows = 128 KB)
+  //   WBUF  : 8 FP16 dequant-weight elements per row (256 KB total)
+  //   ACCUM : 4 FP32 elements per row (64 KB total) — bit-aliased onto the
+  //           same SRAM that previously held 4 INT32 elements, so no SRAM
+  //           layout change. Readers (helper, drain writeback) reinterpret.
   // -------------------------------------------------------------------------
   typedef enum logic [1:0] {
-    BUF_ABUF  = 2'b00,   // Activation buffer: 128 KB INT8
-    BUF_WBUF  = 2'b01,   // Weight buffer:     256 KB INT8
-    BUF_ACCUM = 2'b10    // Accumulator:        64 KB INT32, little-endian
+    BUF_ABUF  = 2'b00,   // Activation buffer: 128 KB FP16
+    BUF_WBUF  = 2'b01,   // Weight buffer:     256 KB FP16 (dequant weights)
+    BUF_ACCUM = 2'b10    // Accumulator:        64 KB FP32, little-endian
     // 2'b11 = reserved — illegal buffer fault
   } buf_id_t;
 

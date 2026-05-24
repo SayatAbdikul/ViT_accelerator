@@ -82,6 +82,46 @@ def test_matmul_w8a16_accumulate_flag():
     np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
 
 
+def test_matmul_w8a16_uses_sequential_k_loop_for_rtl_parity():
+    """MATMUL accumulates k=0..K-1 in order, FP32-mul then FP32-add per step.
+
+    Bit-exact match against a hand-rolled sequential K-loop is the load-bearing
+    invariant for RTL parity: the systolic PE accumulates this way, and any
+    BLAS-driven reordering inside the golden would diverge from RTL at the
+    bit level. With K=64 and a wide value range the chosen reduction order
+    matters at the FP32 RNE rounding boundary; verifying bit-equality here
+    pins the contract before any RTL FP16 datapath work begins.
+    """
+    sim = _make_sim(M_tiles=1, N_tiles=1, K_tiles=4)
+    M, N, K = 16, 16, 64
+    rng = np.random.default_rng(2026)
+    act = (rng.standard_normal((M, K)) * 2.0).astype(np.float16)
+    w = (rng.standard_normal((K, N)) * 2.0).astype(np.float16)
+
+    mem.write_fp16_tile(sim.state, BUF_ABUF, 0, act)
+    mem.write_fp16_tile(sim.state, BUF_WBUF, 0, w)
+
+    insn = MatmulInsn(
+        src1_buf=BUF_ABUF, src1_off=0,
+        src2_buf=BUF_WBUF, src2_off=0,
+        dst_buf=BUF_ACCUM, dst_off=0,
+        flags=0,
+    )
+    sim._execute(insn)
+
+    a32 = act.astype(np.float32)
+    b32 = w.astype(np.float32)
+    expected = np.zeros((M, N), dtype=np.float32)
+    for k in range(K):
+        expected += a32[:, k:k+1] * b32[k:k+1, :]
+
+    got = mem.read_fp32_tile(sim.state, BUF_ACCUM, 0, M, N)
+    assert np.array_equal(got.view(np.uint32), expected.view(np.uint32)), (
+        "MATMUL must bit-match the sequential K-loop reduction; otherwise "
+        "the RTL systolic array (which accumulates this way) will diverge."
+    )
+
+
 # ── VADD ──────────────────────────────────────────────────────────────
 
 

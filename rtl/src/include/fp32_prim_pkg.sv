@@ -462,6 +462,75 @@ package fp32_prim_pkg;
     end
   endfunction
 
+  // FP32 → FP16 narrowing with IEEE-754 round-to-nearest-even (RNE).
+  //   - Finite values outside the FP16 normal range overflow to ±inf
+  //     (matches numpy.float32(...).astype(np.float16) under default
+  //     'unsafe' casting; W8A16 codegen pre-clamps the attention mask
+  //     to -65504 before writing FP16, so overflow does not arise on
+  //     the inference hot path).
+  //   - FP32 NaN → canonical FP16 QNaN ({sign, 5'h1F, 10'h200}).
+  //   - FP32 denormals underflow to FP16 ±0.
+  //   - FP16 subnormals are produced via the same RNE shift; rounding
+  //     up into the smallest FP16 normal is handled explicitly.
+  function automatic logic [15:0] fp32_to_fp16_bits(input fp32_t f);
+    bit          s;
+    logic [7:0]  e8;
+    logic [22:0] f23;
+    int          e_unb;
+    u64_t        mant24;
+    u64_t        rounded;
+    int          shift_amt;
+    logic [9:0]  frac10;
+    begin
+      s   = f[31];
+      e8  = f[30:23];
+      f23 = f[22:0];
+
+      if (e8 == 8'hFF && f23 != 23'd0) begin
+        fp32_to_fp16_bits = {s, 5'h1F, 10'h200};         // NaN
+      end else if (e8 == 8'hFF) begin
+        fp32_to_fp16_bits = {s, 5'h1F, 10'd0};           // ±inf
+      end else if (e8 == 8'd0) begin
+        fp32_to_fp16_bits = {s, 15'd0};                   // FP32 zero/denormal → ±0
+      end else begin
+        e_unb  = int'(e8) - 127;
+        mant24 = {40'd0, 1'b1, f23};                      // implicit 1 + 23-bit frac, zero-extended to 64 b
+        if (e_unb > 15) begin
+          fp32_to_fp16_bits = {s, 5'h1F, 10'd0};         // overflow → ±inf
+        end else if (e_unb >= -14) begin
+          // Normal FP16: shift 24-bit mantissa right by 13 with RNE so
+          // 11 significant bits remain (implicit 1 + 10 frac).
+          rounded = fp32_round_shift_right(mant24, 13);
+          if (rounded == 64'h800) begin
+            // Rounded up into the next binade.
+            if (e_unb + 1 > 15) begin
+              fp32_to_fp16_bits = {s, 5'h1F, 10'd0};
+            end else begin
+              fp32_to_fp16_bits = {s, 5'(e_unb + 1 + 15), 10'd0};
+            end
+          end else begin
+            frac10 = rounded[9:0];
+            fp32_to_fp16_bits = {s, 5'(e_unb + 15), frac10};
+          end
+        end else begin
+          // FP16 subnormal: e16=0, frac = mant24 shifted right enough
+          // that the implicit 1 is absorbed into the fraction. Shift
+          // amount is 13 (normal alignment) plus (-14 - e_unb) extra
+          // bits to make up for the missing exponent room.
+          shift_amt = 13 + (-14 - e_unb);
+          rounded   = fp32_round_shift_right(mant24, shift_amt);
+          if (rounded == 64'h400) begin
+            // Subnormal rounded up into the smallest FP16 normal.
+            fp32_to_fp16_bits = {s, 5'd1, 10'd0};
+          end else begin
+            frac10 = rounded[9:0];
+            fp32_to_fp16_bits = {s, 5'd0, frac10};
+          end
+        end
+      end
+    end
+  endfunction
+
   function automatic fp32_t fp32_div_bits(input fp32_t a, input fp32_t b);
     bit sign_r;
     bit sa, sb;

@@ -1,10 +1,12 @@
 // SRAM subsystem: ABUF, WBUF, ACCUM -- three dual-port SRAMs.
 //
 // Each SRAM row is 128 bits (16 bytes), matching the 16-byte DMA transfer unit.
+// The subsystem itself is precision-agnostic — only the readers (systolic,
+// SFU, helper) interpret the bytes. The current W8A16 datapath holds:
 //
-//   ABUF : 8192 rows × 16 B = 128 KB  (INT8 activations)
-//   WBUF : 16384 rows × 16 B = 256 KB  (INT8 weights / FP16 params / INT32 bias)
-//   ACCUM: 4096 rows × 16 B =  64 KB  (INT32, 4 elements per row, little-endian)
+//   ABUF : 8192 rows × 16 B = 128 KB  (8 FP16 activations / row)
+//   WBUF : 16384 rows × 16 B = 256 KB  (8 FP16 dequant weights / row)
+//   ACCUM: 4096 rows × 16 B =  64 KB  (4 FP32 elements / row, little-endian)
 //
 // Port A (read/write): DMA engine, BUF_COPY, issue-stage write-back
 // Port B (read only):  Systolic array, SFU

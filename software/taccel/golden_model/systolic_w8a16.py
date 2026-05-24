@@ -53,7 +53,14 @@ def execute_matmul_w8a16(state, insn):
     else:
         dst = np.zeros((M, N), dtype=np.float32)
 
-    dst += np.matmul(src1, src2, dtype=np.float32)
+    # Sequential K-loop accumulator, matching the RTL systolic PE's per-cycle
+    # FP32 mul + FP32 add for k = 0..K-1. np.matmul reorders the reduction
+    # under BLAS and would diverge from RTL at the bit level. Each iteration
+    # below is one element-wise FP32 multiply (RNE) followed by one
+    # element-wise FP32 add (RNE), so dst[i,j] evolves as
+    # ((((dst[i,j] + a[i,0]*b[0,j]) + a[i,1]*b[1,j]) + ...) + a[i,K-1]*b[K-1,j]).
+    for k in range(K):
+        dst += src1[:, k:k+1] * src2[k:k+1, :]
 
     memory.write_fp32_tile(state, insn.dst_buf, insn.dst_off, dst)
     state.cycle_count += m_tiles * n_tiles * k_tiles * CYCLE_COST
