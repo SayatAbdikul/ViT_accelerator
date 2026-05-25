@@ -103,7 +103,25 @@ python -m tools.benchmark_w8a32 --max-images 20
 # Memory budget report for either mode.
 python -m tools.profile_memory --mode w8a16
 python -m tools.profile_memory --mode w8a32
+
+# W8A16 RTL-vs-golden bit-exact parity gate (load-bearing acceptance
+# contract; ~1–2 hours of Verilator time for the full 20 images).
+python -m tools.batch_compare_rtl_golden --max-images 20
 ```
+
+## RTL parity contract
+
+The W8A16 RTL must produce **bit-exact** FP16 classifier logits
+against `SimulatorW8A16` on every image of the 20-image frozen
+benchmark. `software/tools/batch_compare_rtl_golden.py` is the sole
+acceptance gate: it asserts
+`np.array_equal(rtl_logits.view(np.uint16), golden_logits.view(np.uint16))`
+with zero ULPs of slack. The gate is load-bearing — a divergence must
+be root-caused at the responsible rounding step (systolic PE, SFU
+narrowing, helper VADD/SCALE_MUL, or per-tile FP16 commit) and fixed
+at that site. **Reviewers must refuse weakening the assertion to a
+tolerance** without a written rationale that names the legitimately
+divergent rounding step.
 
 ## File layout
 

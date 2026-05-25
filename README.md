@@ -103,10 +103,15 @@ Useful entry points:
 - `software/tools/compile_model.py`: compile a model into an accelerator
   program.
 - `software/tools/run_golden.py`: run a program in the Python golden model.
-- `software/tools/compare_rtl_golden.py`: compile/run/compare RTL against the
-  golden model.
-- `software/tools/batch_compare_rtl_golden.py`: run one or more images through
-  the RTL-vs-golden compare flow.
+- `software/tools/compare_rtl_golden.py`: W8A16 RTL-vs-golden **bit-exact**
+  parity check on one (program, FP16 patch) pair. Drives the Verilator
+  runner and `SimulatorW8A16` through the same program, slices the FP16
+  classifier logits from both ABUF images, and asserts byte-equality on
+  the `uint16` view.
+- `software/tools/batch_compare_rtl_golden.py`: load-bearing acceptance
+  gate. Iterates `compare_rtl_golden` over the 20 frozen benchmark
+  images and prints a PASS/FAIL summary with the first FP16 logit that
+  diverges per failing image.
 
 ## Precision Modes
 
@@ -180,12 +185,21 @@ Current numerical and synthesis status:
 - The grep gate at `rtl/verilator/Makefile`'s `synth_gate` target enforces
   that `rtl/src/` (excluding `rtl/src/tb/`) contains no `DPI-C` imports,
   no `real` types, and none of `$realtobits`/`$bitstoreal`/`$rtoi`/`$itor`.
-- RTL is bit-exact-equivalent to the golden model by construction:
-  `software/taccel/golden_model/sfu.py` calls `software/taccel/utils/fp32_prim_ref.py`,
-  which implements the same algorithms as the RTL `fp32_*_bits` package using
-  sequential FP32 left-folds. The sign-off invariant is exact integer logit
-  equality at `software/tools/batch_compare_rtl_golden.py:141`
-  (`raw_logits_exact = golden_logits == rtl_logits`, zero tolerance).
+- RTL is bit-exact-equivalent to the W8A16 golden model by construction:
+  the SFU engine (`rtl/src/sfu_engine.sv`) and systolic PE
+  (`rtl/src/systolic/systolic_pe.sv`) call the same `fp32_*_bits`
+  primitives from `rtl/src/include/fp32_prim_pkg.sv` that
+  `software/taccel/utils/fp32_prim_ref.py` mirrors with sequential FP32
+  left-folds, and the W8A16 golden matmul
+  (`software/taccel/golden_model/systolic_w8a16.py`) uses an explicit
+  per-PE sequential K-loop to match the array's accumulation order. The
+  sign-off invariant is `np.array_equal(rtl_logits.view(np.uint16),
+  golden_logits.view(np.uint16))` — zero ULPs across all 1000 FP16
+  classifier logits, enforced by
+  `software/tools/batch_compare_rtl_golden.py` over the 20 frozen
+  benchmark images. **The bit-exact gate is load-bearing**: a
+  divergence must be root-caused at the responsible rounding step, not
+  papered over with a tolerance.
 
 Remaining work for FPGA bring-up (documented as future work, not in `main`):
 
@@ -253,28 +267,23 @@ Build the full-program RTL runner:
 make -C rtl/verilator run_program
 ```
 
-Run one-image RTL-vs-golden batch compare:
+Run the full 20-image RTL-vs-golden **bit-exact** parity gate (the
+load-bearing W8A16 acceptance contract; ~1–2 hours wall time because
+each image is a full Verilator simulation):
 
 ```bash
 ./.venv/bin/python3 software/tools/batch_compare_rtl_golden.py \
-  --weights software/pytorch_model.bin \
-  --image software/images/frozen_benchmark/000000002006.jpg \
-  --max-images 1 \
-  --summary-out /tmp/batch_compare_one_image/summary.json \
-  --work-dir /tmp/batch_compare_one_image \
-  --keep-work
+  --max-images 20
 ```
 
-Run a lower-level compile-and-compare flow:
+Run a single (program, FP16 patches) bit-exact compare directly (useful
+for first-divergence investigation on one input):
 
 ```bash
 ./.venv/bin/python3 software/tools/compare_rtl_golden.py \
-  --summary-out /tmp/compare_rtl_golden/summary.json \
-  --work-dir /tmp/compare_rtl_golden \
-  compile \
-  --scenario baseline_default \
-  --weights software/pytorch_model.bin \
-  --image software/images/frozen_benchmark/000000002006.jpg
+  --program /tmp/deit_tiny_w8a16.bin \
+  --patches /tmp/patches_fp16.npy \
+  --max-cycles 5000000
 ```
 
 Enable replay-backed QK/SFU regressions when a replay payload bundle exists:

@@ -74,6 +74,8 @@ transformer_accelerator/
 │   ├── run_golden.py                # simulate program.bin
 │   ├── benchmark_w8a16.py           # W8A16 end-to-end accuracy
 │   ├── benchmark_w8a32.py           # W8A32 end-to-end accuracy
+│   ├── compare_rtl_golden.py        # Single-image RTL-vs-golden bit-exact parity
+│   ├── batch_compare_rtl_golden.py  # 20-image parity gate (load-bearing)
 │   ├── profile_memory.py            # ABUF/WBUF/ACCUM peak footprint reporter
 │   ├── export_model_asm.py          # dump assembly for a named preset
 │   └── extract_qkt_replay.py        # build a Q·K^T replay payload bundle
@@ -85,6 +87,8 @@ transformer_accelerator/
     ├── test_tiler.py                    # Tile coverage, QKT pad-transpose
     ├── test_w8a16_{foundation,simulator,compile}.py   # W8A16 path
     ├── test_w8a32_{foundation,simulator,compile}.py   # W8A32 path
+    ├── test_compare_rtl_golden.py       # W8A16 RTL-vs-golden bit-exact gate
+    │                                    # (auto-skipped when verilator missing)
     └── test_vit_base_compile.py         # ViT-B compile + M2/M3 boundaries
 ```
 

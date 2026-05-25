@@ -255,9 +255,9 @@ async def test_addr_reg_independence(dut):
 @cocotb.test()
 async def test_dram_oob_fault(dut):
     """LOAD past DRAM end -> fault_code = 2 (FAULT_DRAM_OOB)."""
-    # DRAM_SIZE = 16 MB = 0x1000000
-    # addr = 0xFFFFF0; end = 0xFFFFF0 + 2*16 = 0x1000010 > 0x1000000
-    NEAR_END = 0xFFFFF0
+    # DRAM_SIZE = 256 MB = 0x10000000 (bumped from 16 MB for W8A16 DeiT-tiny)
+    # addr = 0xFFFFFF0; end = 0xFFFFFF0 + 2*16 = 0x10000010 > 0x10000000
+    NEAR_END = 0xFFFFFF0
     prog = [
         SET_ADDR_LO(0, NEAR_END), SET_ADDR_HI(0, 0),
         LOAD(BUF_ABUF, 0, 2, 0, 0),   # OOB
@@ -321,7 +321,8 @@ async def test_dram_offset_field(dut):
 @cocotb.test()
 async def test_store_oob_fault(dut):
     """STORE past DRAM end should raise FAULT_DRAM_OOB."""
-    NEAR_END = 0xFFFFF0
+    # DRAM_SIZE = 256 MB → addr near 0x10000000 (W8A16 bump).
+    NEAR_END = 0xFFFFFF0
     prog = [
         SET_ADDR_LO(0, NEAR_END), SET_ADDR_HI(0, 0),
         STORE(BUF_ABUF, 0, 2, 0, 0),   # OOB: 2 beats from 0xFFFFF0 crosses 16MB

@@ -51,6 +51,7 @@ struct CliOptions {
     std::string systolic_hidden_snapshot_json_out_path;
     std::string patches_raw_path;
     std::string cls_raw_path;
+    std::string abuf_dump_out_path;
     int patch_rows = 0;
     int patch_cols = 0;
     int num_classes = 1000;
@@ -646,6 +647,7 @@ void print_usage(const char* argv0) {
         << "  --patch-rows <rows>          Patch row count for raw input\n"
         << "  --patch-cols <cols>          Patch column count before 16-byte padding\n"
         << "  --cls-raw <path>             Optional raw INT8 CLS row\n"
+        << "  --abuf-dump-out <path>       Dump full ABUF (128 KB) raw bytes after sim\n"
         << "  --folded-pos-embed           Zero folded position-embedding regions\n"
         << "  --num-classes <n>            Number of ACCUM logits to dump (default 1000)\n"
         << "  --max-cycles <n>             Timeout budget (default 500000)\n"
@@ -756,6 +758,8 @@ CliOptions parse_args(int argc, char** argv) {
             opts.patch_cols = std::stoi(need_value("--patch-cols"));
         } else if (arg == "--cls-raw") {
             opts.cls_raw_path = need_value("--cls-raw");
+        } else if (arg == "--abuf-dump-out") {
+            opts.abuf_dump_out_path = need_value("--abuf-dump-out");
         } else if (arg == "--folded-pos-embed") {
             opts.folded_pos_embed = true;
         } else if (arg == "--num-classes") {
@@ -865,6 +869,7 @@ int main(int argc, char** argv) {
     std::vector<RetireEvent> retire_events;
     std::vector<SnapshotCapture> snapshot_captures;
     std::vector<uint8_t> snapshot_bytes;
+    std::vector<uint8_t> abuf_dump;
     tbutil::SystolicWindowCollector window_collector(0, 0);
     bool window_trace_enabled = false;
     tbutil::AccumWriteLogCollector accum_write_collector(0, 0);
@@ -1097,6 +1102,10 @@ int main(int argc, char** argv) {
         }
 
         summary = build_summary(sim.dut.get(), opts.num_classes);
+        if (!opts.abuf_dump_out_path.empty()) {
+            abuf_dump = tbutil::sram_read_bytes(
+                sim.dut.get(), tbutil::BUF_ABUF_ID, 0, /*ABUF_BYTES=*/131072u);
+        }
         while (next_snapshot_req < snapshot_requests.size()) {
             snapshot_captures.push_back(
                 SnapshotCapture{
@@ -1168,6 +1177,14 @@ int main(int argc, char** argv) {
     write_text_file(opts.json_out_path, summary_to_json(summary));
     if (!opts.trace_json_out_path.empty()) {
         write_text_file(opts.trace_json_out_path, trace_to_json(retire_events, summary));
+    }
+    if (!opts.abuf_dump_out_path.empty() && !abuf_dump.empty()) {
+        // Captured inside the try block (after build_summary) so sim is still
+        // in scope. Dumping the full 128 KB ABUF lets the W8A16 parity harness
+        // (software/tools/compare_rtl_golden.py) slice the FP16 classifier
+        // logits at compiler_manifest['classifier_output']['offset_bytes'] and
+        // bit-exactly compare against SimulatorW8A16.
+        write_binary_file(opts.abuf_dump_out_path, abuf_dump);
     }
     if (!opts.snapshot_manifest_out_path.empty()) {
         write_text_file(opts.snapshot_manifest_out_path, snapshot_manifest_to_json(snapshot_captures));

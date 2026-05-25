@@ -377,10 +377,10 @@ static void test_dram_oob_fault() {
     const char* name = "dram_oob_fault";
     SimHarness s;
 
-    // Set R0 to near end of 16 MB DRAM; xfer_len=2 → 32 bytes past end
-    // DRAM_SIZE = 16 MB = 0x1000000
-    // addr = 0xFFFFF0 = 16777200; end = 16777200 + 32 = 0x1000010 > 0x1000000
-    constexpr uint64_t NEAR_END = 0xFFFFF0;
+    // Set R0 to near end of 256 MB DRAM; xfer_len=2 → 32 bytes past end.
+    // DRAM_SIZE = 256 MB = 0x10000000 (bumped from 16 MB for W8A16 DeiT-tiny).
+    // addr = 0xFFFFFF0; end = 0xFFFFFF0 + 32 = 0x10000010 > 0x10000000
+    constexpr uint64_t NEAR_END = 0xFFFFFF0;
 
     s.load({
         insn::SET_ADDR_LO(0, NEAR_END),
@@ -403,12 +403,13 @@ static void test_store_oob_fault() {
     const char* name = "store_oob_fault";
     SimHarness s;
 
-    constexpr uint64_t NEAR_END = 0xFFFFF0;
+    // DRAM_SIZE = 256 MB (W8A16 bump); 0xFFFFFF0 + 32 bytes crosses 0x10000000.
+    constexpr uint64_t NEAR_END = 0xFFFFFF0;
 
     s.load({
         insn::SET_ADDR_LO(0, NEAR_END),
         insn::SET_ADDR_HI(0, 0),
-        insn::STORE(0, 0, 2, 0, 0),  // OOB: 2 x 16B from 0xFFFFF0 crosses 16MB
+        insn::STORE(0, 0, 2, 0, 0),  // OOB: 2 x 16B from NEAR_END crosses 256MB
         insn::SYNC(0b001),
         insn::HALT(),
     });

@@ -22,7 +22,7 @@
 module dma_engine
   import taccel_pkg::*;
 #(
-  parameter int DRAM_SIZE = 1 << 24   // 16 MB default
+  parameter int DRAM_SIZE = 1 << 28   // 256 MB default — DeiT-tiny W8A16 needs ~25 MB
 )(
   input  logic        clk,
   input  logic        rst_n,

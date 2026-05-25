@@ -303,7 +303,8 @@ module taccel_top
   logic [15:0]  sfu_sram_b_row;
   logic [127:0] sfu_sram_b_rdata;
 
-  logic         dma_sram_en,  dma_sram_we;
+  logic         dma_sram_en /* verilator public_flat_rd */;
+  logic         dma_sram_we /* verilator public_flat_rd */;
   logic [1:0]   dma_sram_buf;
   logic [15:0]  dma_sram_row;
   logic [127:0] dma_sram_wdata, dma_sram_rdata;
