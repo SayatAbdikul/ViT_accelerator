@@ -21,10 +21,22 @@ CXXFLAGS      := -std=c++17 -O2 -Wall -Wno-unused-variable
 # actually scales. Override via `make NPROC=4 ...` on machines where you
 # want to leave cores free.
 NPROC         ?= $(shell nproc 2>/dev/null || echo 4)
+# Parallel simulation: --threads partitions the generated eval across N
+# threads at runtime. 4 is the default — leaves the other half of an 8-core
+# / 16-thread box free for parallel runners or build steps. Set to 0 to
+# disable multithreaded sim (single-threaded eval; smallest binary, useful
+# for tiny tests). Override via `make SIM_THREADS=N ...`.
+SIM_THREADS   ?= 4
+ifneq ($(SIM_THREADS),0)
+VTHREADS_FLAG := --threads $(SIM_THREADS)
+else
+VTHREADS_FLAG :=
+endif
 VFLAGS        := --cc --exe --build --timing \
                  -Wall -Wno-UNUSED -Wno-UNDRIVEN \
                  --x-assign fast --x-initial fast \
-                 -j $(NPROC) --output-split 20000
+                 -j $(NPROC) --output-split 20000 \
+                 $(VTHREADS_FLAG)
 SYSTOLIC_ARCH_MODE ?= 1
 
 SRC_DIR       := ../src
