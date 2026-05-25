@@ -19,8 +19,10 @@ Per-image columns:
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -122,12 +124,87 @@ def _load_local_images(image_ids, image_root):
     return loaded
 
 
+# Per-worker globals populated by _init_worker via fork inheritance. These
+# would otherwise be re-pickled per task; with the "fork" start method they
+# are simply inherited via copy-on-write from the parent process.
+_W_MODEL = None
+_W_FQ_MODEL = None
+_W_STATE_DICT = None
+_W_PROGRAM = None
+_W_CO = None
+
+
+def _init_worker(model, fq_model, state_dict, program, co):
+    """ProcessPoolExecutor initializer — caches large objects in module
+    globals on each worker so per-task pickling is just (img_id, img)."""
+    global _W_MODEL, _W_FQ_MODEL, _W_STATE_DICT, _W_PROGRAM, _W_CO
+    _W_MODEL = model
+    _W_FQ_MODEL = fq_model
+    _W_STATE_DICT = state_dict
+    _W_PROGRAM = program
+    _W_CO = co
+    # Avoid OpenMP oversubscription: each worker gets a single torch thread.
+    # With N workers × 1 thread each, the pool saturates the cores without
+    # any worker thrashing.
+    try:
+        import torch
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+
+def _run_one_image(args):
+    """Worker: returns (img_id, result_or_None_on_skip, reason_or_None).
+
+    result_or_None is (cos_fp32, cos_fq, am_w, am_fp32, am_fq) on success.
+    """
+    img_id, img = args
+    import torch
+    from taccel.golden_model.simulator_w8a16 import SimulatorW8A16
+
+    pixel_values = _preprocess_image(img)
+    with torch.no_grad():
+        ref_fp32 = _W_MODEL(pixel_values=pixel_values).logits.numpy()[0]
+        ref_fq = _W_FQ_MODEL(pixel_values=pixel_values).logits.numpy()[0]
+
+    patches = _host_patch_embed(pixel_values, _W_STATE_DICT)
+
+    sim = SimulatorW8A16()
+    sim.load_program(_W_PROGRAM)
+    patch_bytes = patches.tobytes()
+    sim.state.dram[
+        _W_PROGRAM.input_offset:_W_PROGRAM.input_offset + len(patch_bytes)
+    ] = patch_bytes
+    sim.run(max_instructions=_W_PROGRAM.insn_count + 10)
+    if not sim.state.halted:
+        return img_id, None, "did not reach HALT"
+
+    logits = np.frombuffer(
+        sim.state.abuf,
+        dtype=np.float16,
+        count=_W_CO["N_pad"],
+        offset=_W_CO["offset_bytes"],
+    )[: _W_CO["logical_cols"]].astype(np.float32)
+    if not np.isfinite(logits).all():
+        return img_id, None, "produced NaN/Inf logits"
+
+    cos_fp32 = _cosine(logits, ref_fp32)
+    cos_fq = _cosine(logits, ref_fq)
+    am_w = int(np.argmax(logits))
+    am_fp32 = int(np.argmax(ref_fp32))
+    am_fq = int(np.argmax(ref_fq))
+    return img_id, (cos_fp32, cos_fq, am_w, am_fp32, am_fq), None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="End-to-end W8A16 accuracy benchmark.")
     parser.add_argument("--max-images", type=int, default=len(DEFAULT_IMAGE_IDS),
                         help="Number of frozen benchmark images to evaluate.")
     parser.add_argument("--image-dir", default=LOCAL_FROZEN_IMAGE_DIR,
                         help="Directory holding the local frozen benchmark cache.")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Parallel worker count; 0 (default) = nproc, "
+                             "1 = sequential (skip the process pool).")
     args = parser.parse_args()
 
     import torch
@@ -155,49 +232,58 @@ def main() -> int:
     top1_fp32_match = 0
     top1_fq_match = 0
 
+    workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+    workers = max(1, min(workers, len(images)))
+
     print()
-    print(f"  Running W8A16 simulator on {len(images)} frozen images...")
+    print(f"  Running W8A16 simulator on {len(images)} frozen images "
+          f"({workers} worker{'s' if workers != 1 else ''})...")
     print(f"  {'#':>3}  {'id':>6}  {'cos_fp32':>10}  {'cos_fq':>10}  "
           f"{'argmax(w8a16,fp32,fq)':>26}")
-    for idx, (img_id, img) in enumerate(images, 1):
-        pixel_values = _preprocess_image(img)
-        with torch.no_grad():
-            ref_fp32 = model(pixel_values=pixel_values).logits.numpy()[0]
-            ref_fq = fq_model(pixel_values=pixel_values).logits.numpy()[0]
 
-        patches = _host_patch_embed(pixel_values, state_dict)
+    # Collect by img_id so we can print in submission order regardless of
+    # which worker finishes first.
+    results: dict[int, tuple] = {}
 
-        sim = SimulatorW8A16()
-        sim.load_program(program)
-        patch_bytes = patches.tobytes()
-        sim.state.dram[
-            program.input_offset:program.input_offset + len(patch_bytes)
-        ] = patch_bytes
-        sim.run(max_instructions=program.insn_count + 10)
-        if not sim.state.halted:
-            print(f"  WARNING: image {img_id} did not reach HALT")
+    if workers == 1:
+        # Sequential fallback: same code path as the worker, but no pool.
+        _init_worker(model, fq_model, state_dict, program, co)
+        for img_id, img in images:
+            _, result, reason = _run_one_image((img_id, img))
+            if result is None:
+                print(f"  WARNING: image {img_id} {reason}")
+            else:
+                results[img_id] = result
+    else:
+        # fork: workers inherit model/fq_model/state_dict/program from
+        # parent via COW. Spawn would re-import and re-load the model
+        # per worker (~1-2s each) which would dominate the 20-image budget.
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(model, fq_model, state_dict, program, co),
+        ) as ex:
+            futures = [ex.submit(_run_one_image, (img_id, img))
+                       for img_id, img in images]
+            for fut in as_completed(futures):
+                img_id, result, reason = fut.result()
+                if result is None:
+                    print(f"  WARNING: image {img_id} {reason}")
+                else:
+                    results[img_id] = result
+
+    # Print in original submission order so the table stays deterministic
+    # across runs even though workers complete in any order.
+    for idx, (img_id, _img) in enumerate(images, 1):
+        if img_id not in results:
             continue
-
-        logits = np.frombuffer(
-            sim.state.abuf,
-            dtype=np.float16,
-            count=co["N_pad"],
-            offset=co["offset_bytes"],
-        )[: co["logical_cols"]].astype(np.float32)
-        if not np.isfinite(logits).all():
-            print(f"  WARNING: image {img_id} produced NaN/Inf logits")
-            continue
-
-        cos_fp32 = _cosine(logits, ref_fp32)
-        cos_fq = _cosine(logits, ref_fq)
+        cos_fp32, cos_fq, am_w, am_fp32, am_fq = results[img_id]
         cos_fp32_vals.append(cos_fp32)
         cos_fq_vals.append(cos_fq)
-        am_w = int(np.argmax(logits))
-        am_fp32 = int(np.argmax(ref_fp32))
-        am_fq = int(np.argmax(ref_fq))
         top1_fp32_match += int(am_w == am_fp32)
         top1_fq_match += int(am_w == am_fq)
-
         print(f"  {idx:>3}  {img_id:>6}  {cos_fp32:>10.6f}  {cos_fq:>10.6f}  "
               f"({am_w:>4}, {am_fp32:>4}, {am_fq:>4})")
 
