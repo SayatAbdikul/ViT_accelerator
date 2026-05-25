@@ -16,9 +16,15 @@ export LANG := C
 VERILATOR     ?= verilator
 CXX           ?= g++
 CXXFLAGS      := -std=c++17 -O2 -Wall -Wno-unused-variable
+# Parallel build: -j tells Verilator to fan out the C++ compile across all
+# cores; --output-split caps generated translation-unit size so that fan-out
+# actually scales. Override via `make NPROC=4 ...` on machines where you
+# want to leave cores free.
+NPROC         ?= $(shell nproc 2>/dev/null || echo 4)
 VFLAGS        := --cc --exe --build --timing \
                  -Wall -Wno-UNUSED -Wno-UNDRIVEN \
-                                  --x-assign fast --x-initial fast
+                 --x-assign fast --x-initial fast \
+                 -j $(NPROC) --output-split 20000
 SYSTOLIC_ARCH_MODE ?= 1
 
 SRC_DIR       := ../src
