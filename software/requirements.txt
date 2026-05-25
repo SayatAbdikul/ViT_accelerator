@@ -28,5 +28,6 @@ datasets>=2.18,<5
 # (apt / brew / dnf) or build from source; the cocotb tests select it via
 # `make -C rtl/cocotb SIM=verilator`.
 pytest>=8,<10
+pytest-timeout>=2.3,<3
 cocotb>=1.7,<2
 cocotb-bus>=0.3,<1
