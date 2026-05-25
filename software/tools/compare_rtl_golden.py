@@ -102,8 +102,19 @@ def _run_rtl(
     *,
     max_cycles: int,
     work_dir: Path,
-) -> tuple[bytes, dict]:
-    """Invoke the Verilator runner, return (abuf_bytes, summary_dict)."""
+) -> tuple[Optional[bytes], dict, int]:
+    """Invoke the Verilator runner.
+
+    Returns (abuf_bytes_or_None, summary_dict, exit_code). The runner uses
+    documented exit codes:
+      0 — program halted cleanly
+      2 — parse error or CLI/usage error
+      3 — summary.timeout (program did not halt within --max-cycles)
+      4 — summary.violations non-empty (e.g. forbidden async-engine overlap)
+    Non-zero exits are returned as data — they're legitimate parity-failure
+    signals, not script errors. Callers should consult summary["status"] /
+    summary["fault_*"] for context.
+    """
     rows, cols = patches_fp16.shape
     raw_path = work_dir / "patches_fp16.bin"
     raw_path.write_bytes(patches_fp16.tobytes())
@@ -129,21 +140,46 @@ def _run_rtl(
         "--num-classes", "0",  # we do not consume the ACCUM-INT32 logits dump
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
+
+    # Parse errors (exit 2) leave the summary as a stub with parse_error set;
+    # the runner does not produce an ABUF dump. Surface them as a script
+    # error — they indicate a malformed program / CLI, not a parity result.
+    if proc.returncode == 2:
+        try:
+            stub = json.loads(json_out.read_text())
+            parse_err = stub.get("parse_error", "")
+        except Exception:
+            parse_err = proc.stderr.strip()
         raise RuntimeError(
-            f"RTL runner failed (exit {proc.returncode}):\n"
-            f"  cmd: {' '.join(cmd)}\n"
-            f"  stderr: {proc.stderr.strip()}"
+            f"RTL runner refused the program (exit 2): {parse_err}\n"
+            f"  cmd: {' '.join(cmd)}"
         )
-    summary = json.loads(json_out.read_text())
-    if not abuf_out.exists():
-        raise RuntimeError(f"RTL runner did not produce ABUF dump at {abuf_out}")
-    abuf_bytes = abuf_out.read_bytes()
-    if len(abuf_bytes) != ABUF_BYTES:
+
+    summary: dict
+    try:
+        summary = json.loads(json_out.read_text())
+    except Exception as exc:
         raise RuntimeError(
-            f"Unexpected ABUF dump size: {len(abuf_bytes)} (want {ABUF_BYTES})"
+            f"RTL runner did not produce a readable summary.json: {exc}\n"
+            f"  exit={proc.returncode} stderr={proc.stderr.strip()}\n"
+            f"  cmd: {' '.join(cmd)}"
         )
-    return abuf_bytes, summary
+
+    abuf_bytes: Optional[bytes] = None
+    if abuf_out.exists():
+        raw = abuf_out.read_bytes()
+        if len(raw) != ABUF_BYTES:
+            raise RuntimeError(
+                f"Unexpected ABUF dump size: {len(raw)} (want {ABUF_BYTES})"
+            )
+        abuf_bytes = raw
+    elif proc.returncode == 0:
+        # A clean exit must always produce the dump.
+        raise RuntimeError(
+            f"RTL runner exited cleanly but did not write {abuf_out}"
+        )
+    # exit 3 / 4 with no abuf is fine — the runner aborted before the dump.
+    return abuf_bytes, summary, proc.returncode
 
 
 def _run_golden(program: ProgramBinary, patches_fp16: np.ndarray) -> bytes:
@@ -185,17 +221,37 @@ def compare_program(
         prog_path = tmp_path / "program.bin"
         prog_path.write_bytes(program.to_bytes())
 
-        rtl_abuf, rtl_summary = _run_rtl(
+        rtl_abuf, rtl_summary, rtl_exit = _run_rtl(
             runner, prog_path, patches_fp16,
             max_cycles=max_cycles, work_dir=tmp_path,
         )
         golden_abuf = _run_golden(program, patches_fp16)
 
-    rtl_bits = _slice_logits_bits(rtl_abuf, co)
-    gold_bits = _slice_logits_bits(golden_abuf, co)
-
     rtl_status = rtl_summary.get("status", "unknown")
     rtl_cycles = int(rtl_summary.get("cycles", 0))
+    gold_bits = _slice_logits_bits(golden_abuf, co)
+    gold_argmax = int(np.argmax(gold_bits.view(np.float16).astype(np.float32)))
+
+    # Runner did not produce a valid ABUF (timeout / violation / fault). The
+    # RTL did not run the program to completion, so there's no bit-exact
+    # comparison to make — record the runner status and fail the parity gate.
+    if rtl_abuf is None or rtl_status != "halted":
+        return ParityResult(
+            image_id=image_id,
+            passed=False,
+            rtl_status=rtl_status,
+            golden_halted=True,
+            rtl_cycles=rtl_cycles,
+            first_divergence_index=None,
+            rtl_logit_bits=None,
+            golden_logit_bits=None,
+            rtl_argmax=None,
+            golden_argmax=gold_argmax,
+            rtl_summary_json=rtl_summary,
+        )
+
+    rtl_bits = _slice_logits_bits(rtl_abuf, co)
+    rtl_argmax = int(np.argmax(rtl_bits.view(np.float16).astype(np.float32)))
 
     if np.array_equal(rtl_bits, gold_bits):
         return ParityResult(
@@ -207,8 +263,8 @@ def compare_program(
             first_divergence_index=None,
             rtl_logit_bits=None,
             golden_logit_bits=None,
-            rtl_argmax=int(np.argmax(rtl_bits.view(np.float16).astype(np.float32))),
-            golden_argmax=int(np.argmax(gold_bits.view(np.float16).astype(np.float32))),
+            rtl_argmax=rtl_argmax,
+            golden_argmax=gold_argmax,
             rtl_summary_json=rtl_summary,
         )
 
@@ -223,29 +279,46 @@ def compare_program(
         first_divergence_index=first,
         rtl_logit_bits=int(rtl_bits[first]),
         golden_logit_bits=int(gold_bits[first]),
-        rtl_argmax=int(np.argmax(rtl_bits.view(np.float16).astype(np.float32))),
-        golden_argmax=int(np.argmax(gold_bits.view(np.float16).astype(np.float32))),
+        rtl_argmax=rtl_argmax,
+        golden_argmax=gold_argmax,
         rtl_summary_json=rtl_summary,
     )
 
 
 def format_result(result: ParityResult) -> str:
-    if result.passed:
-        head = "PASS"
-        body = (
-            f"  rtl_status={result.rtl_status} cycles={result.rtl_cycles}\n"
-            f"  argmax: rtl={result.rtl_argmax} golden={result.golden_argmax}"
-        )
-    else:
-        head = "FAIL"
-        body = (
-            f"  rtl_status={result.rtl_status} cycles={result.rtl_cycles}\n"
-            f"  first divergence at logit[{result.first_divergence_index}]: "
-            f"rtl=0x{result.rtl_logit_bits:04x} golden=0x{result.golden_logit_bits:04x}\n"
-            f"  argmax: rtl={result.rtl_argmax} golden={result.golden_argmax}"
-        )
     tag = f"image_id={result.image_id}" if result.image_id is not None else "single"
-    return f"[{head}] {tag}\n{body}"
+    if result.passed:
+        return (
+            f"[PASS] {tag}\n"
+            f"  rtl_status={result.rtl_status} cycles={result.rtl_cycles}\n"
+            f"  argmax: rtl={result.rtl_argmax} golden={result.golden_argmax}"
+        )
+
+    # The RTL didn't reach HALT — surface why instead of an arbitrary "logit[0]
+    # diverged" message (we don't have RTL logits to diverge with).
+    if result.first_divergence_index is None:
+        fault_ctx = result.rtl_summary_json.get("fault_context", {})
+        body = (
+            f"  rtl_status={result.rtl_status} cycles={result.rtl_cycles} "
+            f"(no bit-exact comparison — runner did not halt)\n"
+            f"  golden argmax={result.golden_argmax}"
+        )
+        if fault_ctx.get("valid"):
+            body += (
+                f"\n  fault: code={fault_ctx.get('fault_code')} "
+                f"pc={fault_ctx.get('pc')} "
+                f"opcode={fault_ctx.get('opcode')} "
+                f"source={fault_ctx.get('source_name')}"
+            )
+        return f"[FAIL] {tag}\n{body}"
+
+    return (
+        f"[FAIL] {tag}\n"
+        f"  rtl_status={result.rtl_status} cycles={result.rtl_cycles}\n"
+        f"  first divergence at logit[{result.first_divergence_index}]: "
+        f"rtl=0x{result.rtl_logit_bits:04x} golden=0x{result.golden_logit_bits:04x}\n"
+        f"  argmax: rtl={result.rtl_argmax} golden={result.golden_argmax}"
+    )
 
 
 # ---------------------------------------------------------------------------

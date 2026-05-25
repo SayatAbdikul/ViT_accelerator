@@ -122,9 +122,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  ─── W8A16 RTL-vs-golden bit-exact gate: {n_pass}/{n} PASS ───")
     if n_pass != n:
         print()
-        print("  Failures (first divergence per image):")
+        print("  Failures per image:")
         for r in results:
-            if not r.passed:
+            if r.passed:
+                continue
+            if r.first_divergence_index is None:
+                # Runner did not halt — no logits to diverge with.
+                print(f"   image {r.image_id}: rtl_status={r.rtl_status} "
+                      f"(cycles={r.rtl_cycles}); no bit-exact comparison")
+            else:
                 print(f"   image {r.image_id}: "
                       f"logit[{r.first_divergence_index}] "
                       f"rtl=0x{r.rtl_logit_bits:04x} "
