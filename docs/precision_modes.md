@@ -96,7 +96,9 @@ python -m tools.compile_model --weights pytorch_model.bin -o program.bin --mode 
 # Simulate (mode must match the compile mode).
 python -m tools.run_golden program.bin --input patches.npy --mode w8a16
 
-# Accuracy benchmarks on the 20 frozen images.
+# Accuracy benchmarks on the 20 frozen images. benchmark_w8a16 fans the
+# per-image torch forwards + SimulatorW8A16 dispatch across processes by
+# default (--workers=$(nproc)); pass --workers 1 to force sequential.
 python -m tools.benchmark_w8a16 --max-images 20
 python -m tools.benchmark_w8a32 --max-images 20
 

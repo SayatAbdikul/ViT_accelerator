@@ -54,6 +54,11 @@ When a bug is fixed, prefer the smallest regression at the lowest useful layer f
 
 ## Running Tests
 
+`VFLAGS` passes `-j $(NPROC) --output-split 20000` so the per-target
+build fans out across cores; override with `make NPROC=4 ...` to leave
+cores free on a shared machine. A clean `run_program` build is ~2m30s
+on a 16-core box.
+
 - Native Verilator:
   - `make -C rtl/verilator test_decode`
   - `make -C rtl/verilator test_dma`

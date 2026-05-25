@@ -72,7 +72,7 @@ transformer_accelerator/
 │   ├── disasm.py                    # .bin → .asm
 │   ├── compile_model.py             # pytorch_model.bin → program.bin
 │   ├── run_golden.py                # simulate program.bin
-│   ├── benchmark_w8a16.py           # W8A16 end-to-end accuracy
+│   ├── benchmark_w8a16.py           # W8A16 end-to-end accuracy (parallel per-image via --workers)
 │   ├── benchmark_w8a32.py           # W8A32 end-to-end accuracy
 │   ├── compare_rtl_golden.py        # Single-image RTL-vs-golden bit-exact parity
 │   ├── batch_compare_rtl_golden.py  # 20-image parity gate (load-bearing)
@@ -684,7 +684,11 @@ Loads a `ProgramBinary`, creates a `MachineState` pre-loaded with the data secti
 
 ## Tests
 
-102 tests, all passing (`pytest tests/ -q`).
+148 tests passing, 2 skipped (`pytest tests/ -q`, ~63 s on a 16-core
+machine). The pytest invocation runs under a 300-second per-test
+`timeout` (enabled in `pytest.ini`, requires `pytest-timeout` from
+`requirements.txt`), which catches hung Verilator integration tests
+instead of stalling CI indefinitely.
 
 ### `test_isa_encoding.py` (39 tests)
 

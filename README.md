@@ -144,6 +144,10 @@ For the end-to-end accuracy benchmarks:
 ./.venv/bin/python3 software/tools/benchmark_w8a32.py --max-images 20
 ```
 
+`benchmark_w8a16.py` parallelises the per-image work across processes
+by default (`--workers=$(nproc)`); pass `--workers 1` to run sequentially
+for debugging.
+
 W8A16 picks up most of the W8A32 accuracy at half the dequant-DRAM
 footprint — `cos vs FP32 ≥ 0.997`, `cos vs fake_quant ≥ 0.998`. See
 `docs/precision_modes.md` for the motivation behind W8A16 and the load-
@@ -247,6 +251,11 @@ Build and run the full native Verilator suite:
 ```bash
 make -C rtl/verilator all
 ```
+
+The Verilator builds fan out across cores via `-j $(nproc)` plus
+`--output-split 20000` in `VFLAGS`; on a 16-core box a clean
+`run_program` build drops from ~9 min to ~2m30s. Override with
+`make NPROC=4 ...` on shared machines.
 
 Run selected RTL tests:
 
