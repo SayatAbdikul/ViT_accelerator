@@ -29,7 +29,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from taccel.compiler.compiler import Compiler
+from taccel.compiler.cache import load_or_compile
 from taccel.model_config import ModelConfig
 from taccel.golden_model.simulator_w8a16 import SimulatorW8A16
 from taccel.quantizer.fake_quant import apply_weight_quantization
@@ -216,10 +216,11 @@ def main() -> int:
     fq_model, _ = apply_weight_quantization(model)
     fq_model.eval()
 
-    print("Compiling DeiT-tiny in W8A16 mode (this happens once)...")
+    print("Compiling DeiT-tiny in W8A16 mode (cached on disk; skip on hit)...")
     state_dict = model.state_dict()
-    compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a16")
-    program = compiler.compile_w8a16(state_dict)
+    program = load_or_compile(
+        ModelConfig.deit_tiny(), state_dict, mode="w8a16", verbose=True,
+    )
     print(f"  {program.insn_count} instructions, "
           f"{len(program.data):,} bytes data")
 

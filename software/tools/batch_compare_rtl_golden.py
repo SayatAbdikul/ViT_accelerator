@@ -35,7 +35,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from taccel.compiler.compiler import Compiler  # noqa: E402
+from taccel.compiler.cache import load_or_compile  # noqa: E402
 from taccel.model_config import ModelConfig  # noqa: E402
 from taccel.quantizer.fake_quant import apply_weight_quantization  # noqa: E402
 from taccel.quantizer.quantize import quantize_tensor, dequantize_tensor  # noqa: E402
@@ -60,9 +60,10 @@ def _compile_program(model_name: str):
     model.eval()
     state_dict = model.state_dict()
 
-    print("Compiling DeiT-tiny in W8A16 mode (this happens once)...")
-    compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a16")
-    program = compiler.compile_w8a16(state_dict)
+    print("Compiling DeiT-tiny in W8A16 mode (cached on disk; skip on hit)...")
+    program = load_or_compile(
+        ModelConfig.deit_tiny(), state_dict, mode="w8a16", verbose=True,
+    )
     print(f"  {program.insn_count} instructions, "
           f"{len(program.data):,} bytes data")
     return state_dict, program

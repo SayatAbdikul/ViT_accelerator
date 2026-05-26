@@ -83,7 +83,7 @@ def _compile_deit_tiny_w8a16():
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
     from transformers import ViTForImageClassification
-    from taccel.compiler.compiler import Compiler
+    from taccel.compiler.cache import load_or_compile
     from taccel.model_config import ModelConfig
 
     try:
@@ -94,8 +94,7 @@ def _compile_deit_tiny_w8a16():
         pytest.skip(f"DeiT-tiny weights unreachable: {exc}")
     model.eval()
     state_dict = model.state_dict()
-    compiler = Compiler(cfg=ModelConfig.deit_tiny(), mode="w8a16")
-    program = compiler.compile_w8a16(state_dict)
+    program = load_or_compile(ModelConfig.deit_tiny(), state_dict, mode="w8a16")
     return state_dict, program
 
 
