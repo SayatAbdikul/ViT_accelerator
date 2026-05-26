@@ -53,6 +53,9 @@ transformer_accelerator/
 │   │   ├── codegen_w8a16.py       # W8A16 codegen (default)
 │   │   ├── codegen_w8a32.py       # W8A32 codegen
 │   │   ├── compiler.py            # Top-level: model → ProgramBinary
+│   │   ├── cache.py               # Disk cache for compiled programs
+│   │   ├── dma_emitter.py         # AddrPlanner: per-addr_reg state + dram_off walking
+│   │   ├── sync_coalesce.py       # Peephole: drop SYNCs that the RTL auto-fences
 │   │   └── passes/                # IR passes (seq tiling, memory estimate)
 │   │
 │   ├── golden_model/          # Bit-accurate hardware simulator
@@ -510,6 +513,60 @@ ProgramBinary(instructions, data)
 ```
 
 Default calibration (used when no real calibration data is provided) assumes `max_abs ≈ 6.0` for all activations, which is representative for post-LayerNorm transformer activations.
+
+### `taccel/compiler/dma_emitter.py` — `AddrPlanner`
+
+DMA setup squeezed two ways:
+
+* **Cache per addr_reg.** Every codegen instance owns an `AddrPlanner`
+  whose four-slot cache mirrors what the RTL / golden will have in
+  `addr_regs[r]` at each program point. `plan_access(reg, byte_addr)`
+  emits SET_ADDR_LO / SET_ADDR_HI only when the corresponding 28-bit
+  half actually changes — DeiT-tiny's 14.6 MB image fits in 28 bits,
+  so SET_ADDR_HI is 100% redundant after the first write.
+* **`dram_off` walking.** The M-type LOAD/STORE already carries a
+  16-bit, 16-byte-scaled `dram_off` field that the DMA engine adds to
+  the address register. When a requested access is within
+  `[cached, cached + 1 MB)`, no SET_ADDR is emitted at all and the
+  byte delta is encoded directly in `dram_off`.
+
+Together the two cut DeiT-tiny from 1,288,764 to 657,846 instructions
+(−49.0%) without touching the RTL — `dma_engine.sv` already computes
+`addr_regs[reg] + dram_off*16`.
+
+### `taccel/compiler/sync_coalesce.py` — `coalesce_dma_syncs`
+
+Peephole pass over `self.instructions` that drops `SYNC(0b001)` (DMA
+fence) bits whose hazard the RTL already enforces at issue.
+
+What the RTL actually guarantees:
+
+* Helper ops (`BUF_COPY`, `SCALE_MUL`, `VADD`) and SFU ops (`SOFTMAX`,
+  `LAYERNORM`, `GELU`) auto-stall on `dma_busy` at issue
+  (`control_unit.sv` lines 287, 321, 366). The pass strips the DMA
+  bit before any of them.
+* `OP_MATMUL` does **not** auto-stall on `dma_busy` (line 340) — the
+  SYNC before MATMUL is load-bearing.
+* `OP_LOAD` and `OP_STORE` do not auto-stall either (line 297); the
+  DMA engine itself has no command queue and only accepts a dispatch
+  pulse while in `D_IDLE` (`dma_engine.sv` line 187). Issuing a
+  second DMA op while the first is in flight silently drops the
+  pulse. **The SYNC between adjacent DMA ops is architectural, not
+  defensive.** Removing it produces a silent miscompile that the
+  bit-exact gate then catches.
+
+The pass's reduction on DeiT-tiny is modest (~3,644 SYNCs out of
+317k) because most SYNCs in the program fence DMA→DMA and
+DMA→MATMUL, neither of which can be relaxed. The bigger win in
+Bucket A comes from `AddrPlanner` above.
+
+### `taccel/compiler/cache.py` — `load_or_compile`
+
+Disk cache for compiled `ProgramBinary` artifacts keyed by
+SHA-256(state_dict) + SHA-256(cfg, mode). Cache directory is
+`$TACCEL_COMPILE_CACHE_DIR` or `~/.cache/taccel/compile/`; set
+`TACCEL_NO_COMPILE_CACHE=1` to bypass when iterating on the compiler
+itself (otherwise stale entries would silently serve the old program).
 
 ---
 

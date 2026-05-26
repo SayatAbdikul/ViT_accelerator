@@ -111,6 +111,39 @@ python -m tools.profile_memory --mode w8a32
 python -m tools.batch_compare_rtl_golden --max-images 20
 ```
 
+## Codegen passes that affect both modes
+
+Two thin compiler passes ride on top of the W8A16/W8A32 codegen and
+cut the emitted program by ~49% without changing semantics. They are
+silent (no logging, no manifest changes) and the bit-exact parity
+gate is the verification.
+
+* **`compiler/dma_emitter.py::AddrPlanner`.** Caches the value the
+  RTL/golden will hold in each of the four 56-bit `addr_regs` and
+  emits SET_ADDR_LO/HI only on actual change. Also uses the M-type
+  `dram_off` field (16-bit, ×16-byte) to walk inside a 1 MB window of
+  the cached base without re-emitting SET_ADDR at all. RTL
+  `dma_engine.sv` already computes `addr_regs[reg] + dram_off*16`, so
+  the change is compiler-side only.
+* **`compiler/sync_coalesce.py::coalesce_dma_syncs`.** Drops
+  SYNC(`0b001`) bits whose hazard the RTL already enforces at issue:
+  helper consumers (`BUF_COPY` line 287, `SCALE_MUL` / `VADD`
+  line 321) and SFU consumers (`SOFTMAX` / `LAYERNORM` / `GELU`
+  line 366) auto-stall on `dma_busy` in `control_unit.sv`. The pass
+  **keeps** SYNCs that fence `OP_MATMUL` (line 340 does not check
+  `dma_busy`), and crucially keeps SYNCs between adjacent
+  `OP_LOAD` / `OP_STORE` — the DMA engine has no command queue
+  (`dma_engine.sv` line 187), so a second dispatch pulse arriving
+  while DMA is mid-flight is silently dropped. That class of SYNC is
+  architectural, not defensive, and removing it produces a silent
+  miscompile (verified to fail the bit-exact gate during this work).
+
+DeiT-tiny W8A16 instruction count drops from 1,288,764 to 657,846
+(−49.0%); program bytes 10.3 MB → 5.3 MB. SET_ADDR_LO falls from
+314,050 to 822 and SET_ADDR_HI from 314,050 to 4; the SYNC reduction
+is modest (~3,644 instructions) because most SYNCs in DeiT-tiny
+fence DMA→DMA and DMA→MATMUL, neither of which can be relaxed.
+
 ## RTL parity contract
 
 The W8A16 RTL must produce **bit-exact** FP16 classifier logits

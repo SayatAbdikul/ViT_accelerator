@@ -48,7 +48,8 @@ from .tiler import pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
 from .sreg_allocator import SRegAllocator
 from .scale_emitter import emit_scale
-from .dma_emitter import set_addr
+from .dma_emitter import AddrPlanner
+from .sync_coalesce import coalesce_dma_syncs as _coalesce_dma_syncs
 
 UNIT = 16
 ELEM_BYTES = 4  # FP32 activations: 4 bytes per element
@@ -80,6 +81,11 @@ class CodeGeneratorW8A32:
         self.dram_blob = bytearray()
         self.sregs = SRegAllocator()
         self.staging_dram_offsets: Dict[str, int] = {}
+        # Tracks current value of each addr_reg so SET_ADDR_LO/HI writes
+        # that wouldn't change the register are elided, and successive
+        # DMA accesses within a 1 MB window of a cached base reuse it via
+        # the M-type ``dram_off`` field.
+        self.addr_planner = AddrPlanner()
         # W8A32 has no trace gate; manifest stays empty so downstream consumers
         # (ProgramBinary) see a structurally-valid but empty trace surface.
         self.trace_manifest: Dict[int, List[Dict[str, Any]]] = {}
@@ -114,6 +120,7 @@ class CodeGeneratorW8A32:
                 "logical_cols": int(self.cfg.num_classes),
             }
         self.instructions.append(HaltInsn())
+        self.instructions = _coalesce_dma_syncs(self.instructions)
         return self.instructions, bytes(self.dram_blob)
 
     def _mark_deferred_loads(self, graph: IRGraph):
@@ -220,26 +227,28 @@ class CodeGeneratorW8A32:
 
     def _emit_dma_load(self, buf_id: int, sram_off_units: int, size_bytes: int,
                        addr_reg: int, dram_byte_offset: int):
-        self.instructions.extend(set_addr(addr_reg, dram_byte_offset))
+        setup, dram_off = self.addr_planner.plan_access(addr_reg, dram_byte_offset)
+        self.instructions.extend(setup)
         xfer_units = (size_bytes + UNIT - 1) // UNIT
         self._emit(LoadInsn(
             buf_id=buf_id,
             sram_off=sram_off_units,
             xfer_len=min(xfer_units, 0xFFFF),
             addr_reg=addr_reg,
-            dram_off=0,
+            dram_off=dram_off,
         ))
 
     def _emit_dma_store(self, buf_id: int, sram_off_units: int, size_bytes: int,
                         addr_reg: int, dram_byte_offset: int):
-        self.instructions.extend(set_addr(addr_reg, dram_byte_offset))
+        setup, dram_off = self.addr_planner.plan_access(addr_reg, dram_byte_offset)
+        self.instructions.extend(setup)
         xfer_units = (size_bytes + UNIT - 1) // UNIT
         self._emit(StoreInsn(
             buf_id=buf_id,
             sram_off=sram_off_units,
             xfer_len=min(xfer_units, 0xFFFF),
             addr_reg=addr_reg,
-            dram_off=0,
+            dram_off=dram_off,
         ))
 
     def _dram_offset(self, name: str, context: str = "") -> int:

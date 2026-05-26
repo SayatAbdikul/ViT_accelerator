@@ -153,6 +153,29 @@ footprint — `cos vs FP32 ≥ 0.997`, `cos vs fake_quant ≥ 0.998`. See
 `docs/precision_modes.md` for the motivation behind W8A16 and the load-
 bearing accuracy gates.
 
+Codegen ships two thin passes that the compiler runs unconditionally;
+they cut the DeiT-tiny W8A16 instruction count by ~49% without
+touching the RTL or weakening the bit-exact gate:
+
+* `compiler/dma_emitter.py::AddrPlanner` caches the value of each
+  address register and uses the M-type `dram_off` field (16-bit,
+  ×16-byte) to walk inside a 1 MB window without re-emitting
+  SET_ADDR. Drives SET_ADDR_HI to ≈0 and SET_ADDR_LO down by ~99.7%
+  on DeiT-tiny.
+* `compiler/sync_coalesce.py::coalesce_dma_syncs` drops SYNC(0b001)
+  bits the RTL already enforces at issue: helper / SFU ops
+  (`BUF_COPY`, `SCALE_MUL`, `VADD`, `SOFTMAX`, `LAYERNORM`, `GELU`)
+  auto-stall on `dma_busy` in `control_unit.sv`. The SYNC before
+  `OP_MATMUL` and between adjacent DMA ops is **load-bearing** —
+  the DMA engine has no command queue (`dma_engine.sv` line 187),
+  so a second dispatch pulse during an in-flight LOAD is silently
+  dropped. The pass keeps those SYNCs verbatim.
+
+Net DeiT-tiny W8A16: **1,288,764 → 657,846 instructions** (10.3 MB →
+5.3 MB of program bytes). The golden simulator's `decode()` hot path
+(~34% of golden runtime) gets a proportional speedup, so the cosine-
+gate benchmarks complete faster as well.
+
 ## RTL Stack
 
 Important RTL files:
