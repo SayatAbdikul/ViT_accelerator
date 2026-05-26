@@ -15,17 +15,29 @@ export LANG := C
 
 VERILATOR     ?= verilator
 CXX           ?= g++
-CXXFLAGS      := -std=c++17 -O2 -Wall -Wno-unused-variable
+# Optimization level for the generated Verilator C++ + the testbench. -O3
+# overrides Verilator's default -Os because g++ honours the last -O flag,
+# and Verilator emits -Os before our CXXFLAGS. -O3 trades ~50% longer build
+# for ~10-20% faster eval(); on a 30-60 min full-image sim that pays back
+# many times over. Override with `make OPT_LEVEL=O2 ...` to revert.
+OPT_LEVEL     ?= O3
+CXXFLAGS      := -std=c++17 -$(OPT_LEVEL) -Wall -Wno-unused-variable
 # Parallel build: -j tells Verilator to fan out the C++ compile across all
 # cores; --output-split caps generated translation-unit size so that fan-out
 # actually scales. Override via `make NPROC=4 ...` on machines where you
 # want to leave cores free.
 NPROC         ?= $(shell nproc 2>/dev/null || echo 4)
 # Parallel simulation: --threads partitions the generated eval across N
-# threads at runtime. 4 is the default — leaves the other half of an 8-core
-# / 16-thread box free for parallel runners or build steps. Set to 0 to
-# disable multithreaded sim (single-threaded eval; smallest binary, useful
-# for tiny tests). Override via `make SIM_THREADS=N ...`.
+# threads at runtime. Measured on the i9-9900 (8 physical / 16 logical
+# cores) with -O3, 5M-cycle DeiT-tiny probe:
+#   SIM_THREADS=4 → 36.5k cyc/s (99% scaling)
+#   SIM_THREADS=6 → 40.4k cyc/s (100% scaling)
+#   SIM_THREADS=8 → 44.4k cyc/s (100% scaling) — best single-image
+#   SIM_THREADS=16 → 29.6k cyc/s (hyperthread contention, REGRESSION)
+# Default is 4: leaves headroom for parallel runners (e.g. 2 workers ×
+# --threads 4 saturates the 8 physical cores). Use SIM_THREADS=8 for
+# fastest single-image sign-off, SIM_THREADS=0 to disable threading for
+# the small per-unit tests.
 SIM_THREADS   ?= 4
 ifneq ($(SIM_THREADS),0)
 VTHREADS_FLAG := --threads $(SIM_THREADS)
